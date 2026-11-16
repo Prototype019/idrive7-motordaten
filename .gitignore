@@ -3,3 +3,5 @@ dist/
 packages/
 *.log
 .DS_Store
+# BMWs oap-sdk, lokal aus der eigenen Firmware extrahiert - nicht weitergeben
+oap-sdk/
