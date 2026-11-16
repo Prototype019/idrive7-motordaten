@@ -2,7 +2,7 @@
   "id": "km_motordaten",
   "title": "Motordaten",
   "description": "Live-Motordaten der DME wie die M2-App: Temperaturen, Drücke, Drehzahl, Leistung, Klopfen; Maximalwerte, Logs, Fehlerspeicher lesen/löschen; MHD Max Cooling (wird automatisch erkannt).",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "vendor": "Prototype019",
   "loggingId": "KMD1",
   "iconGlyph": "gauge",
@@ -26,6 +26,10 @@
       "_broadcasts": [
         "sendTasuResponse"
       ]
+    },
+    "de.bmw.infotainment.KombiIF": {
+      "_optional": "Uhrzeit/Zeitzone fuer Rekorde und Logs",
+      "statusShowTimeDate": "rs"
     }
   },
   "screens": [
@@ -33,54 +37,7 @@
       "name": "MAIN",
       "kind": "canvas",
       "title": "Motordaten",
-      "buttons": [
-        [
-          "BTN_SETTINGS",
-          "Einstellungen"
-        ]
-      ]
-    }
-  ],
-  "settings": [
-    {
-      "key": "theme",
-      "label": "Farben",
-      "type": "choice",
-      "default": "m_tricolour",
-      "options": [
-        [
-          "m_red",
-          "M Rot"
-        ],
-        [
-          "m_tricolour",
-          "M Tricolour"
-        ],
-        [
-          "ice",
-          "Eisweiss"
-        ],
-        [
-          "amber",
-          "Nacht-Amber"
-        ]
-      ]
-    },
-    {
-      "key": "tempUnit",
-      "label": "Temperatur",
-      "type": "choice",
-      "default": "c",
-      "options": [
-        [
-          "c",
-          "Celsius"
-        ],
-        [
-          "f",
-          "Fahrenheit"
-        ]
-      ]
+      "buttons": []
     }
   ]
 }

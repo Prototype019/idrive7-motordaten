@@ -17,6 +17,10 @@ den [mgu-store](https://github.com/robertnisipeanu/mgu-store).
   bei laufendem Motor. Abschaltbar unter Einstellungen.
 - **Fehlerspeicher:** lesen bei allen Steuergeräten; **löschen** nur bei Zündung an
   und Motor aus, mit Bestätigung, Steuergerät für Steuergerät, nie die Headunit.
+- **Bedienung (ab 0.3.0):** Antippen und Controller (drehen/drücken) auf allen
+  Knöpfen und Tabs. Rekorde bleiben nach Neustart erhalten, Fehlertexte werden
+  einmal mit Internet (Store-Uplink) geladen und dann offline genutzt.
+- Diagnose-Abfragen laufen nur, solange die App sichtbar ist oder ein Log aufzeichnet.
 - Nicht vorhanden: USB-Export der Logs (auf iDrive 7 nicht verfügbar).
 - Gilt für G-Serie-Benziner mit DME8FF_R, also **B58 und S58** (auch B48/B38).
 
@@ -44,12 +48,16 @@ mgu-repo.json     sagt dem Store: Apps unter apps/*, Build mit kit/tools/build.p
 
 ## Technik, kurz
 
-`dash.js` zeichnet die Seiten als Bild (2880×764, wie am M2), das in den
-ID7-Bildbereich (1600×520) eingepasst und über `ui.image` ausgegeben wird. Die
-Werte liest `main.js` per UDS-Diagnose (`0x22 ReadDataByIdentifier`) aus der DME
+`dash.js` zeichnet die Seiten (2880×764, wie am M2) als Vektor-Zeichenbefehle in den
+Recorder des Kits, auf den ID7-Bildbereich (1600×520) skaliert und über `ui.image`
+ausgegeben; die Knöpfe sind Kit-Ziele (`cv.target`), dadurch gehen Touch und
+Controller. Pixelbilder würden vom nativen Renderer verworfen und sperren die
+Eingabe. Schriften: Barlow als Kit-Atlanten (`kit/runtime/fonts/md_*.json`, OFL).
+Die Werte liest `main.js` per UDS-Diagnose (`0x22 ReadDataByIdentifier`) aus der DME
 (0x12), dem Getriebe (EGS 0x18) und einer OBD-PID – über `kit/diag.js`, dekodiert
 mit `decode.js` (DME8FF_R). Alle Diagnose-Anfragen laufen nacheinander über eine
-Warteschlange, damit ein Schreibbefehl nie mit dem Polling kollidiert.
+Warteschlange, damit ein Schreibbefehl nie mit dem Polling kollidiert. Das
+MHD-Ergebnis wird gespeichert (bei „kein MHD" nach 7 Tagen neu geprüft).
 
 ## Grundlagen und Lizenzen
 
@@ -71,4 +79,5 @@ Enthält keine BMW-Software und keine Fahrzeug-Identdaten.
 ## Lizenz
 
 MIT (siehe [LICENSE](LICENSE)). Das Kit unter `kit/` behält seine eigene
-MIT-Lizenz (`kit/LICENSE.kit`).
+MIT-Lizenz (`kit/LICENSE.kit`). Die Barlow-Schriften stehen unter der SIL OFL 1.1
+(`apps/km_motordaten/LICENSE`, wird mit ausgeliefert).

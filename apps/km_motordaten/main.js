@@ -3,16 +3,23 @@
  * Motordaten fuer BMW iDrive 7 (MGU), auch ID8 - dieselbe App wie die M2-Version
  * (Prototype019/motordaten, iDrive 8), nur auf dem MGU App Kit (kit/, MIT).
  *
- * Das Design ist 1:1 die ID8-App: dash.js zeichnet die Seiten (2880x764), wir
- * passen sie in den ID7-Bildbereich (1600x520) ein und uebergeben das Bild.
- * Werte liest es per UDS-Diagnose (0x22) aus der DME (0x12), dem Getriebe
- * (EGS 0x18) und einer OBD-PID - ueber kit/diag.js, dekodiert mit decode.js
- * (DME8FF_R, B58/S58). Fehlerspeicher lesen: 19 02 an alle Steuergeraete.
+ * ANZEIGE: dash.js (das Design der iDrive-8-App, 2880x764) zeichnet direkt in den
+ * Kit-Recorder, ueber eine Transformation (cv.xf) in den sichtbaren Bereich einge-
+ * passt. Vektor statt Pixelbild: der Store-Renderer (mgu-render/1) zeigt keine
+ * Pixelbilder, und nur mit Recorder fuehrt das Kit den Bildschirm. Schriften sind
+ * die der M2-App (Barlow) als Kit-Atlanten kit/runtime/fonts/md_*.json.
+ * EINGABE: jedes Feld aus dash.targets() ist ein Kit-Ziel (cv.target) - Antippen
+ * und Druecken mit dem Dreh-Drueck-Steller rufen es auf, Drehen springt weiter.
+ *
+ * WERTE: UDS 0x22 aus DME (0x12), EGS (0x18) und OBD 01 42 ueber kit/diag.js,
+ * gestaffelt wie die M2-App, nur solange die App sichtbar ist oder aufnimmt. Werte,
+ * Spitzen, Rekorde und Aufnahme laufen in einem eigenen 100-ms-Takt (wie die M2-App),
+ * nicht im Zeichen-Takt.
  *
  * Zwei Schreib-Aktionen wie in der M2-App, mit denselben Schutzregeln:
- *  - MHD Max Cooling (2F 03 01/00 nur an die DME): die App erkennt selbst, ob die
- *    DME mit MHD laeuft (einmalige Abfrage "Max Cooling aus", Echo 6F 03 00), und
- *    zeigt den Knopf nur dann. An nur bei laufendem Motor (> 500 U/min).
+ *  - MHD Max Cooling (2F 03 01/00 nur an die DME). Ob die DME mit MHD laeuft, fragt
+ *    die App EINMAL je Auto ab ("Max Cooling aus", Echo 6F 03 00) - Ergebnis wird
+ *    gemerkt (data/mhd.json, ein "nein" nach 7 Tagen neu geprueft). An nur > 500 U/min.
  *  - Fehlerspeicher loeschen (14 FF FF FF): nur Zuendung an + Motor aus, mit
  *    Bestaetigung, Steuergeraet fuer Steuergeraet, nie die Headunit (0x63).
  *
@@ -23,59 +30,75 @@ var path = require('path');
 var mgu = require('./kit/mgu');
 var Car = require('./kit/car');
 var Diag = require('./kit/diag').Diag;
-var setImage = require('./kit/record').setImage;
 
 var dash = require('./dash.js');
 var decode = require('./decode.js');
 var Limits = require('./limits.js');
-var KitCanvas = require('./kit_canvas.js').Canvas;
 var clock = require('./clock.js');
 var Records = require('./records.js').Records;
 var logbook = require('./logbook.js');
 var faults = require('./faults.js');
+var DtcTexts = require('./dtctext.js').DtcTexts;
 
 var DME = 0x12, EGS = 0x18;
 var HOLD_MS = 4000, RPM_RUN = 400, PEAK_AFTER_MS = 5000, GLIDE_MS = 90;
-var CYCLE_MS = 250;
-var SW = dash.W, SH = dash.H;          // 2880 x 764 (dash.js)
+var CYCLE_MS = 250;          // Diagnose-Runde
+var TICK_MS = 100;           // Werte, Spitzen, Rekorde, Aufnahme (wie die M2-App)
+var DRAW_MS = 66;            // hoechstens ~15 Bilder/s (der GPU-Renderer tickt bis 60/s)
+var SLOW_EVERY = 12, ENGINE2_EVERY = 6;
+var COOLING_MIN_RPM = 500;
+var TEXTS_EVERY_MS = 300000;
+var MHD_RETRY_MS = 7 * 24 * 3600 * 1000;
+var SW = dash.W, SH = dash.H;                       // 2880 x 764 (dash.js)
 
-// DID-Gruppen (Benziner G-Serie, DME8FF_R = G20 B58). Ids -> decode.js-Tabellen.
-var FAST = [0x4807, 0x5891, 0x4205, 0x4AB0, 0x4436, 0x4ABC, 0x5813];
-var SLOW = [0x580F, 0x4201, 0x582F, 0x4402, 0x4300, 0x59D4];
-var KNOCK = [0x554C, 0x4A49, 0x4A4A, 0x4A4C, 0x4A4D, 0x4A4E, 0x4A4F];
-var BATTERY = [0x5425];
+// Sichtbarer Bereich der 1600x520-Seite im GPU-Vollbild (display.js FULL.src): oben 38 px, seitlich 12 px weg.
+var VIS = { x: 12, y: 38, w: 1576, h: 482 };
+var K = VIS.w / SW;                                  // dash -> Seite
+var OX = VIS.x, OY = VIS.y + (VIS.h - SH * K) / 2;
+var FONT = { label: 'md_label', scale: 'md_scale', num: 'md_num', bold: 'md_label', light: 'md_label', gear: 'md_num' };
 
-var KEYOF = {
-    0x4807: 'rpm', 0x5891: 'torque', 0x4205: 'boostAbs', 0x4AB0: 'boostTargetAbs',
-    0x4436: 'oilPressAbs', 0x4ABC: 'airMass', 0x5813: 'load',
-    0x580F: 'intake', 0x4201: 'ambient', 0x582F: 'exhaust', 0x4402: 'oil', 0x4300: 'coolant', 0x59D4: 'charge',
-    0x554C: 'knock', 0x4A49: 'ign1', 0x4A4A: 'ign2', 0x4A4C: 'ign3', 0x4A4D: 'ign4', 0x4A4E: 'ign5', 0x4A4F: 'ign6',
-    0x5425: 'battSoc'
-};
+// DID-Gruppen wie die M2-App ([Schluessel, DID]), Benziner G-Serie DME8FF_R (B58/S58).
+var FAST = [['rpm', 0x4807], ['torque', 0x5891], ['boostAbs', 0x4205], ['boostTargetAbs', 0x4AB0],
+    ['oilPressAbs', 0x4436], ['airMass', 0x4ABC], ['load', 0x5813]];
+var ENGINE = [['lambda', 0x5889], ['lambdaTarget', 0x5816], ['rail', 0x5658], ['railTarget', 0x56C1],
+    ['fuelLowAbs', 0x58F3], ['ignition', 0x59FA], ['pedal', 0x480B]];
+var CYLINDER_DIDS = [0x4A49, 0x4A4A, 0x4A4C, 0x4A4D, 0x4A4E, 0x4A4F];
+var KNOCK = [['knock', 0x554C]].concat(CYLINDER_DIDS.map(function (id, i) { return ['ign' + (i + 1), id]; }));
+var ENGINE2 = [['throttle', 0x4600], ['fuelFlow', 0x4521], ['fuelTemp', 0x4AD5]];
+var COOLING = [['coolTarget', 0x4310], ['fanDuty', 0x587F], ['fanRpm', 0x594F], ['thermostat', 0x4A74],
+    ['pumpTarget', 0x5910], ['pumpRpm', 0x58EA], ['pumpCharge', 0x5912], ['fanSet', 0x5594]];
+var BATTERY = [['battSoc', 0x5425]];
+var SLOW = [['intake', 0x580F], ['ambient', 0x4201], ['exhaust', 0x582F], ['oil', 0x4402], ['coolant', 0x4300],
+    ['charge', 0x59D4]];
+var MAXK = ['rpm', 'power', 'torque', 'boost', 'oilPress', 'oil', 'coolant', 'gearbox', 'intake', 'charge', 'exhaust', 'knock'];
 
 var isNum = function (v) { return typeof v === 'number' && isFinite(v); };
-var MAXK = ['rpm', 'power', 'torque', 'boost', 'oilPress', 'oil', 'coolant', 'gearbox', 'intake', 'charge', 'exhaust', 'knock'];
 
 mgu.run({
     start: function (ctx) {
-        var log = ctx.log, ui = ctx.ui, settings = ctx.settings;
-
+        var log = ctx.log, ui = ctx.ui;
+        // vor allem anderen: Records/Limits/Logbook/Fehlertexte lesen ihren Ordner ueber KM_DATA_DIR
         if (ctx.dataDir) { try { process.env.KM_DATA_DIR = ctx.dataDir; } catch (e) { } }
-
         var dataDir = process.env.KM_DATA_DIR || '';
-        var cfg = Limits.load();                      // Grenzwerte, gespeichert in data/limits.json
+        var t0 = Date.now();
+
+        var cfg = Limits.load();
         function saveCfg() { try { Limits.save(cfg); } catch (e) { log.warn('limits save: ' + e); } }
 
-        // MHD: einmal erkannt -> in data/mhd.json gemerkt (dann keine erneute Abfrage)
+        // ---- MHD-Ergebnis (je Auto einmal fragen) ----
         var MHD_FILE = dataDir ? path.join(dataDir, 'mhd.json') : null;
-        var mhd = null;                               // true = MHD erkannt, false = DME kennt die Routine nicht, null = offen
-        try { if (MHD_FILE && JSON.parse(fs.readFileSync(MHD_FILE, 'utf8')).mhd === true) mhd = true; } catch (e) { }
-        function saveMhd() { try { if (MHD_FILE) fs.writeFileSync(MHD_FILE, JSON.stringify({ mhd: true, at: Date.now() })); } catch (e) { } }
-        var cooling = { state: null }, coolingTimer = null;
-        var probeAt = 0, probeTries = 0;
+        var mhd = null;                                  // true / false / null = noch offen
+        try {
+            var mj = MHD_FILE ? JSON.parse(fs.readFileSync(MHD_FILE, 'utf8')) : null;
+            if (mj && mj.mhd === true) mhd = true;
+            else if (mj && mj.mhd === false && Date.now() - (mj.at || 0) < MHD_RETRY_MS) mhd = false;
+        } catch (e) { }
+        function saveMhd(v) { try { if (MHD_FILE) fs.writeFileSync(MHD_FILE, JSON.stringify({ mhd: v, at: Date.now() })); } catch (e) { } }
+
+        var cooling = { state: null }, coolingTimer = null, probeAt = 0, probeTries = 0, probing = false;
         var recordsConfirm = false;
 
-        // Alle Diagnose-Anfragen nacheinander (Polling, Fehler lesen, Schreibbefehle)
+        // Alle Diagnose-Anfragen nacheinander (Polling, Fehler lesen/loeschen, Max Cooling)
         var chain = Promise.resolve();
         function serial(fn) { var p = chain.then(fn, fn); chain = p.then(function () { }, function () { }); return p; }
 
@@ -83,89 +106,119 @@ mgu.run({
         var cds = { oil: null, coolant: null, rpm: null };
         var peak = {}, trip = {}, startedAt = 0, running = false;
         var bars = { rpm: null, boost: null };
-        var lastFrame = 0, lastV = null;
+        var lastFrame = 0, lastV = null, lastDraw = 0;
         var page = 'main';
         var extra = {};
         var records = new Records();
-        var rec = null, recStart = 0, faultsBusy = false;
+        var texts = new DtcTexts(log, dataDir || undefined), textsTimer = null;
+        var rec = null, faultsBusy = false, clearing = false;
 
-        var car = new Car(ctx, ['rpm', 'temps'], { demo: false });
+        function visible() { return ui.isVisible('MAIN'); }
+        function active() { return visible() || !!rec; }
+
+        // ---- Werte-Quellen ----
+        var car = new Car(ctx, ['rpm', 'temps']);
+        car.onSample(function () {
+            try {
+                var d = car.data();
+                if (d && !d.demo) { cds.rpm = d.rpm; cds.oil = d.oil; cds.coolant = d.coolant; }   // nie Kit-Demo-Werte
+            } catch (e) { log.warn('car: ' + e); }
+        });
         var link = new Diag(ctx.signals, log);
         link.quiet = true; link.busyLog = false;
-        var diagReady = false;
-        link.init().then(function () { diagReady = true; }).catch(function (e) { log.warn('diag init: ' + e); });
+        var diagReady = false, diagErr = null;
+        link.init().then(function () { diagReady = true; if (!link.p) diagErr = link.error || 'kein Diagnose-Dienst'; },
+            function (e) { diagErr = String(e && e.message || e); });
 
-        var acc22 = function (u) { return u[0] === 0x62 || (u[0] === 0x7F && u[1] === 0x22); };
-        var acc01 = function (u) { return (u[0] === 0x41 && u[1] === 0x42) || (u[0] === 0x7F && u[1] === 0x01); };
+        // Uhr des Autos (Zeitzone/Sommerzeit) aus der Anzeige im Kombi - fuer Rekord- und Log-Zeiten
+        ctx.signals.watch('de.bmw.infotainment.KombiIF', '1', {
+            statusShowTimeDate: function (v) {
+                try { if (clock.setCluster(v)) log.info('Uhr: UTC' + (clock.offset() >= 0 ? '+' : '') + (clock.offset() / 60) + ' h'); } catch (e) { }
+            }
+        }, log).then(function (s) { if (s && s.error) log.warn('Kombi-Uhr: ' + s.error); }, function () { });
 
         function keep(key, v) {
             var now = Date.now();
             if (isNum(v)) { m[key] = v; mAt[key] = now; }
             else if (mAt[key] && now - mAt[key] > HOLD_MS) { m[key] = null; }
         }
-        function readGroup(ecu, ids) {
-            var data = [];
-            for (var i = 0; i < ids.length; i++) { data.push(ids[i] >> 8, ids[i] & 0xFF); }
-            return link.physical(ecu, 0x22, data, 700, acc22).then(function (uds) {
-                var dids = [];
-                for (var j = 0; j < ids.length; j++) { var d = decode.didById(ids[j]); if (d) dids.push(d); }
-                var got = uds ? decode.didNumbers(dids, uds) : null;
-                for (var k = 0; k < ids.length; k++) { keep(KEYOF[ids[k]], got ? got[ids[k]] : null); }
-            }, function () { for (var k = 0; k < ids.length; k++) keep(KEYOF[ids[k]], null); });
+        // eine 22-Anfrage fuer eine Gruppe (bis 8 DIDs); angenommen nur die Antwort, die mit der ersten DID beginnt
+        function readGroup(ecu, pairs) {
+            var data = [], dids = [];
+            for (var i = 0; i < pairs.length; i++) {
+                data.push(pairs[i][1] >> 8, pairs[i][1] & 0xFF);
+                var d = decode.didById(pairs[i][1]); if (d) dids.push(d);
+            }
+            var first = pairs[0][1];
+            var acc = function (u) { return (u[0] === 0x62 && ((u[1] << 8) | u[2]) === first) || (u[0] === 0x7F && u[1] === 0x22); };
+            return link.physical(ecu, 0x22, data, 700, acc).then(function (uds) {
+                var got = uds ? decode.didNumbers(dids, uds) : null, n = 0;
+                for (var k = 0; k < pairs.length; k++) {
+                    var v = got ? got[pairs[k][1]] : null;
+                    if (isNum(v)) n++;
+                    keep(pairs[k][0], v);
+                }
+                return n;
+            }, function () { for (var k = 0; k < pairs.length; k++) keep(pairs[k][0], null); return 0; });
         }
         function readEgs() {
-            return link.physical(EGS, 0x22, [0x60, 0x00], 700, acc22).then(function (uds) {
+            var acc = function (u) { return (u[0] === 0x62 && u[1] === 0x60 && u[2] === 0x00) || (u[0] === 0x7F && u[1] === 0x22); };
+            return link.physical(EGS, 0x22, [0x60, 0x00], 700, acc).then(function (uds) {
                 keep('gearbox', uds ? decode.didNumber(decode.didById(0x6000), uds) : null);
             }, function () { keep('gearbox', null); });
         }
         function readVoltage() {
-            return link.physical(DME, 0x01, [0x42], 700, acc01).then(function (uds) {
+            var acc = function (u) { return (u[0] === 0x41 && u[1] === 0x42) || (u[0] === 0x7F && u[1] === 0x01); };
+            return link.physical(DME, 0x01, [0x42], 700, acc).then(function (uds) {
                 keep('voltage', uds ? decode.obdNumber(decode.pidById(0x42), uds) : null);
             }, function () { keep('voltage', null); });
         }
 
+        // ---- Diagnose-Runde (gestaffelt wie die M2-App), nur sichtbar oder beim Aufnehmen ----
         var round = 0, sampling = false;
         function sampleOnce() {
-            if (sampling || !diagReady || !link.p || faultsBusy) { return Promise.resolve(); }
+            if (sampling || !diagReady || !link.p || faultsBusy || clearing || !active()) return;
             sampling = true; round++;
-            return serial(function () {
-                var seq = readGroup(DME, FAST);
-                if (round % 2 === 0) { seq = seq.then(function () { return readGroup(DME, KNOCK); }); }
-                if (round % 6 === 0) {
-                    seq = seq.then(function () { return readGroup(DME, SLOW); })
-                        .then(function () { return readGroup(DME, BATTERY); })
-                        .then(readEgs).then(readVoltage);
-                }
-                return seq;
+            var r = round, slow = r % SLOW_EVERY === 0 || !isNum(m.ambient) || !isNum(m.gearbox);
+            serial(function () {
+                return readGroup(DME, FAST).then(function (answered) {
+                    var seq = Promise.resolve();
+                    var add = function (fn) { seq = seq.then(fn); };
+                    if (answered > 0) {
+                        if (r % 2 === 0) add(function () { return readGroup(DME, KNOCK); });
+                        if (rec && r % 2 === 1) add(function () { return readGroup(DME, ENGINE); });
+                        if (rec && r % ENGINE2_EVERY === 3) add(function () { return readGroup(DME, ENGINE2); });
+                        if (slow || (rec && r % 4 === 2)) add(function () { return readGroup(DME, COOLING); });
+                        if (slow) add(function () { return readGroup(DME, BATTERY); });
+                    }
+                    if (slow) {
+                        add(function () { return readGroup(DME, SLOW); });
+                        add(readEgs); add(readVoltage);
+                    }
+                    return seq;
+                });
             }).then(function () { sampling = false; probeMhd(); }, function () { sampling = false; });
         }
-        setInterval(function () { sampleOnce(); }, CYCLE_MS);
+        setInterval(function () { try { sampleOnce(); } catch (e) { sampling = false; log.warn('runde: ' + e); } }, CYCLE_MS);
 
-        // ---- MHD erkennen: die DME einmal harmlos fragen (Max Cooling AUS = 2F 03 00) ----
-        // Echo 6F 03 00 -> die DME laeuft mit MHD-Code. NRC "Dienst/ID unbekannt" -> kein MHD.
-        // Keine oder andere Antwort -> spaeter nochmal (hoechstens 5 Versuche, alle 20 s).
+        // ---- MHD erkennen: einmal je Auto die DME harmlos fragen (Max Cooling AUS = 2F 03 00) ----
         var accCool = function (u) { return (u[0] === 0x6F && u[1] === 0x03) || (u[0] === 0x7F && u[1] === 0x2F); };
-        var probing = false;
         function probeMhd() {
-            if (mhd !== null || probing || probeTries >= 5 || !isNum(m.rpm) || Date.now() - probeAt < 20000) return;
+            if (mhd !== null || probing || probeTries >= 5 || !visible() || !isNum(m.rpm) || Date.now() - probeAt < 20000) return;
             probing = true; probeAt = Date.now(); probeTries++;
             serial(function () { return link.physical(DME, 0x2F, [0x03, 0x00], 2500, accCool); }).then(function (u) {
                 probing = false;
                 if (u && u[0] === 0x6F && u[1] === 0x03 && u[2] === 0x00) {
-                    mhd = true; saveMhd(); cooling.state = 'OFF';
-                    if (!cfg.mhdCoolingOn) { cfg.mhdCoolingOn = 1; saveCfg(); }   // beim ersten Erkennen einschalten
+                    mhd = true; saveMhd(true); cooling.state = 'OFF';
+                    if (!cfg.mhdCoolingOn) { cfg.mhdCoolingOn = 1; saveCfg(); }       // beim ersten Erkennen einschalten
                     log.info('MHD erkannt: Max Cooling verfuegbar');
                 } else if (u && u[0] === 0x7F && (u[2] === 0x11 || u[2] === 0x12 || u[2] === 0x31)) {
-                    mhd = false; log.info('kein MHD (DME: ' + u[2].toString(16) + ')');
+                    mhd = false; saveMhd(false); log.info('kein MHD (DME: ' + u[2].toString(16) + ')');
                 }
             }, function () { probing = false; });
         }
 
-        car.onSample(function () {
-            var d = car.data();
-            if (d) { cds.rpm = d.rpm; cds.oil = d.oil; cds.coolant = d.coolant; }
-        });
-
+        // ---- Ableitungen (wie die M2-App) ----
         var PS_PER_KW = 1.35962;
         function airPowerPs(air, load) {
             if (!isNum(air) || air <= 0 || !isNum(load)) return null;
@@ -183,35 +236,37 @@ mgu.run({
             return isNum(peak[key]) ? peak[key] : null;
         }
         function pick(a, b) { return isNum(a) ? a : (isNum(b) ? b : null); }
+        function num(v) { return isNum(v) ? v : null; }
 
         function buildV() {
-            var v = {};
-            var ambient = isNum(m.ambient) ? m.ambient / 1000 : null;
+            var ambient = isNum(m.ambient) ? m.ambient / 1000 : null;            // hPa -> bar
             var above = function (abs) { return (isNum(abs) && isNum(ambient)) ? abs - ambient : null; };
-            v.rpm = rpmNow();
-            v.oil = pick(m.oil, cds.oil);
-            v.coolant = pick(m.coolant, cds.coolant);
-            v.intake = isNum(m.intake) ? m.intake : null;
-            v.charge = isNum(m.charge) ? m.charge : null;
-            v.boost = above(m.boostAbs);
-            v.boostTarget = above(m.boostTargetAbs);
-            v.oilPress = above(m.oilPressAbs);
-            v.gearbox = isNum(m.gearbox) ? m.gearbox : null;
-            v.exhaust = isNum(m.exhaust) ? m.exhaust : null;
-            v.voltage = isNum(m.voltage) ? m.voltage : null;
-            v.battSoc = (isNum(m.battSoc) && m.battSoc >= 0 && m.battSoc <= 100) ? m.battSoc : null;
-            v.battVoltage = null; v.battCurrent = null;
-            v.knock = isNum(m.knock) ? m.knock : null;
-            v.load = isNum(m.load) ? m.load : null;
-            v.airMass = isNum(m.airMass) ? m.airMass : null;
-
-            var ang = [m.ign1, m.ign2, m.ign3, m.ign4, m.ign5, m.ign6];
+            var v = {
+                rpm: rpmNow(), oil: pick(m.oil, cds.oil), coolant: pick(m.coolant, cds.coolant),
+                intake: num(m.intake), charge: num(m.charge), boost: above(m.boostAbs), boostTarget: above(m.boostTargetAbs),
+                oilPress: above(m.oilPressAbs), gearbox: num(m.gearbox), exhaust: num(m.exhaust), voltage: num(m.voltage),
+                // nur beim Aufnehmen gelesen (ENGINE/ENGINE2): fuer die Logs
+                lambda: num(m.lambda), lambdaTarget: num(m.lambdaTarget), rail: num(m.rail), railTarget: num(m.railTarget),
+                fuelLow: above(m.fuelLowAbs), knock: num(m.knock), ignition: num(m.ignition), pedal: num(m.pedal), load: num(m.load),
+                airMass: num(m.airMass), throttle: num(m.throttle), fuelFlow: num(m.fuelFlow), fuelTemp: num(m.fuelTemp),
+                battSoc: (isNum(m.battSoc) && m.battSoc >= 0 && m.battSoc <= 100) ? m.battSoc : null,
+                coolTarget: num(m.coolTarget), fanDuty: num(m.fanDuty), fanRpm: num(m.fanRpm), thermostat: num(m.thermostat),
+                pumpTarget: num(m.pumpTarget), pumpRpm: num(m.pumpRpm), pumpCharge: num(m.pumpCharge),
+                pumpPct: isNum(m.pumpTarget) ? m.pumpTarget / 255 * 100 : null,
+                pumpChargePct: isNum(m.pumpCharge) ? m.pumpCharge / 255 * 100 : null,
+                fan: isNum(m.fanDuty) ? m.fanDuty : num(m.fanSet),
+                battCurrent: null, battTemp: null, battVoltage: null     // Sensor-DIDs verweigert die DME (wie M2)
+            };
+            // jeder Zylinder unter dem fruehesten: was die Klopfregelung dort zuruecknimmt (nur bei laufendem Motor)
+            var ang = CYLINDER_DIDS.map(function (id, i) { return m['ign' + (i + 1)]; });
             v.knockCyl = null;
-            if (isNum(v.rpm) && v.rpm > 600 && ang.every(isNum)) {
-                var top = Math.max.apply(null, ang), lo = Math.min.apply(null, ang);
-                if (top - lo > 0.4) { v.knockCyl = ang.indexOf(lo) + 1; }
+            if (ang.every(isNum) && isNum(v.rpm) && v.rpm > 600) {
+                var top = Math.max.apply(null, ang);
+                ang.forEach(function (a, i) { v['knockCyl' + (i + 1)] = top - a; });
+                var worst = ang.indexOf(Math.min.apply(null, ang));
+                v.knockCyl = top - ang[worst] > 0.4 ? worst + 1 : null;
             }
-
+            // Leistung/Drehmoment: Luftmassen-Schaetzung vs. DME-Drehmoment (Schub: 0)
             var rpm = isNum(v.rpm) ? Math.max(0, v.rpm) : null;
             var dmeTq = isNum(m.torque) ? Math.max(0, m.torque) : null;
             var dmePw = (dmeTq !== null && rpm !== null) ? dmeTq * rpm / 9549 * PS_PER_KW : null;
@@ -219,7 +274,7 @@ mgu.run({
             if (airPw !== null && (dmePw === null || airPw > dmePw) && rpm !== null && rpm > 500) {
                 v.power = airPw; v.torque = airPw / PS_PER_KW * 9549 / rpm;
             } else { v.power = dmePw; v.torque = dmeTq; }
-
+            // Motor-Start-Flanke -> Spitzen dieser Fahrt neu
             if (isNum(rpm)) {
                 var run = rpm >= RPM_RUN;
                 if (run && running === false) { startedAt = Date.now(); peak = {}; trip = {}; }
@@ -228,18 +283,19 @@ mgu.run({
             v.rpmPeak = peakOf('rpm', v.rpm); v.torquePeak = peakOf('torque', v.torque);
             v.powerPeak = peakOf('power', v.power); v.boostPeak = peakOf('boost', v.boost);
             v.oilPressPeak = peakOf('oilPress', v.oilPress);
-
-            // Spitzen fuer Maximalwerte (diese Fahrt) + Rekorde (ueber alle Fahrten)
+            // Maximalwerte dieser Fahrt + Rekorde ueber alle Fahrten (Zeit als Millisekunden, wie M2)
             if (Date.now() - startedAt > PEAK_AFTER_MS) {
                 for (var mi = 0; mi < MAXK.length; mi++) {
                     var mk = MAXK[mi], mv = v[mk];
-                    if (isNum(mv) && (!isNum(trip[mk]) || mv > trip[mk])) { trip[mk] = mv; records.offer(mk, mv, clock.wall()); }
+                    if (isNum(mv) && (!isNum(trip[mk]) || mv > trip[mk])) { trip[mk] = mv; records.offer(mk, mv, clock.wall().getTime()); }
                 }
             }
-
-            var allNull = FAST.every(function (id) { return !isNum(m[KEYOF[id]]); });
-            if (diagReady && link.p && round > 2 && allNull) { v.status = 'Keine Antwort der DME – Zündung an?'; v.statusErr = false; }
-            else { v.status = ''; v.statusErr = false; }
+            // Statuszeile
+            v.status = ''; v.statusErr = false;
+            if (diagErr || (!diagReady && Date.now() - t0 > 15000)) { v.status = 'Diagnose nicht erreichbar' + (diagErr ? ': ' + diagErr : ''); v.statusErr = true; }
+            else if (diagReady && link.p && round > 2 && FAST.every(function (p) { return !isNum(m[p[0]]); })) {
+                v.status = 'Keine Antwort der DME – Zündung an?';
+            }
             return v;
         }
 
@@ -255,35 +311,61 @@ mgu.run({
             v.rpmBar = bars.rpm; v.boostBar = bars.boost;
         }
 
-        // ---- Fehlerspeicher lesen (nur lesend, 19 02 an alle Steuergeraete) ----
+        // ---- 100-ms-Takt: Werte, Spitzen, Rekorde, Aufnahme (unabhaengig vom Zeichnen) ----
+        setInterval(function () {
+            try {
+                if (!active()) return;
+                lastV = buildV();
+                if (rec) {
+                    if (rec.sample(lastV) === false) { stopRecording(); }
+                    else { extra.recording = { ms: Date.now() - rec.started }; }
+                }
+            } catch (e) { log.warn('takt: ' + e); }
+        }, TICK_MS);
+
+        // ---- Fehlerspeicher lesen (19 02 an alle Steuergeraete) + Texte ----
+        function annotateFaults() {
+            var f = extra.faults;
+            if (!f || !f.scan) return;
+            f.scan.forEach(function (u) { u.entries.forEach(function (e) { e.text = texts.text(e.ecu, e.code); }); });
+            extra.faults = Object.assign({}, f, { texts: texts.count() });
+        }
+        function syncTexts(first) {
+            clearTimeout(textsTimer); textsTimer = null;
+            Promise.resolve().then(function () { return texts.sync(first); }).then(function (n) { if (n) annotateFaults(); },
+                function (e) { log.warn('Fehlertexte: ' + (e && e.message)); }).then(function () {
+                if (!texts.complete()) textsTimer = setTimeout(function () { syncTexts(); }, TEXTS_EVERY_MS);
+            });
+        }
         function readFaults(note) {
-            if (faultsBusy || !diagReady || !link.p) return;
+            if (faultsBusy || clearing || !diagReady || !link.p) return;
             faultsBusy = true;
             var addrs = faults.addresses();
             var scan = addrs.map(function (a) { return { addr: a, name: faults.unitName(a), state: 'wait', entries: [] }; });
             extra.faults = { reading: true, scan: scan, progress: 0 };
             var replied = {};
-            serial(function () { return link.functional(0x19, [0x02, 0x0D], { maxMs: 7000, onReply: function () { extra.faults.progress = (extra.faults.progress || 0) + 1; } }); })
-                .then(function (map) {
-                    var reps = new Map();
-                    if (map && map.forEach) { map.forEach(function (uds, ecu) { reps.set(ecu, uds); replied[ecu] = 1; }); }
-                    var parsed = faults.parse(reps) || { entries: [] };
-                    var entries = parsed.entries || [];
-                    for (var i = 0; i < scan.length; i++) {
-                        var u = scan[i];
-                        u.entries = entries.filter(function (e) { return e.ecu === u.addr; });
-                        u.state = replied[u.addr] ? (u.entries.length ? 'faults' : 'ok') : 'none';
-                    }
-                    extra.faults = { scan: scan, units: addrs.length, entries: entries, at: new Date(), note: note || null };
-                    faultsBusy = false;
-                }, function (e) {
-                    extra.faults = { scan: scan, units: addrs.length, entries: [], at: new Date(), error: String(e && e.message || e) };
-                    faultsBusy = false;
+            serial(function () {
+                return link.functional(0x19, [0x02, 0x0D], { maxMs: 7000, onReply: function () { if (extra.faults) extra.faults.progress = (extra.faults.progress || 0) + 1; } });
+            }).then(function (map) {
+                var reps = new Map();
+                if (map && map.forEach) { map.forEach(function (uds, ecu) { reps.set(ecu, uds); replied[ecu] = 1; }); }
+                var entries = (faults.parse(reps) || {}).entries || [];
+                scan.forEach(function (u) {
+                    u.entries = entries.filter(function (e) { return e.ecu === u.addr; });
+                    u.state = replied[u.addr] ? (u.entries.length ? 'faults' : 'ok') : 'none';
                 });
+                var n = note ? note + (entries.length ? ' Noch ' + entries.length + ' Einträge.' : ' Keine Einträge mehr.') : null;
+                extra.faults = { scan: scan, units: addrs.length, entries: entries, at: clock.wall(), note: n };
+                faultsBusy = false;
+                annotateFaults();
+                syncTexts(Object.keys(replied).map(Number).filter(function (a) { return entries.some(function (e) { return e.ecu === a; }); }));
+            }, function (e) {
+                extra.faults = { scan: scan, units: addrs.length, entries: [], at: clock.wall(), error: String(e && e.message || e) };
+                faultsBusy = false;
+            });
         }
 
         // ---- MHD Max Cooling (wie die M2-App): an nur bei laufendem Motor, aus jederzeit ----
-        var COOLING_MIN_RPM = 500;
         function coolingNote(note) {
             clearTimeout(coolingTimer);
             cooling = Object.assign({}, cooling, { note: note, confirm: false });
@@ -312,8 +394,7 @@ mgu.run({
             sendCooling(cooling.state !== 'ON');
         }
 
-        // ---- Fehlerspeicher loeschen (wie die M2-App): nur Zuendung an + Motor aus, mit Bestaetigung,
-        // Steuergeraet fuer Steuergeraet (14 FF FF FF), nie die Headunit (0x63). Danach neu lesen. ----
+        // ---- Fehlerspeicher loeschen (wie die M2-App) ----
         var NO_CLEAR = [0x63];
         var acc14 = function (u) { return u[0] === 0x54 || (u[0] === 0x7F && u[1] === 0x14); };
         function clearBlocked() {
@@ -325,12 +406,14 @@ mgu.run({
         }
         function clearFaults() {
             var f = extra.faults || {};
+            if (clearing || faultsBusy || !f.confirmClear) return;              // nur nach der Bestaetigung, nie doppelt
             var why = clearBlocked();
             if (why) { extra.faults = Object.assign({}, f, { note: why, warn: true, confirmClear: false }); return; }
             var units = [];
             (f.entries || []).forEach(function (e) { if (units.indexOf(e.ecu) < 0) units.push(e.ecu); });
             var skipped = units.filter(function (u) { return NO_CLEAR.indexOf(u) >= 0; });
             var todo = units.filter(function (u) { return NO_CLEAR.indexOf(u) < 0; });
+            clearing = true;
             extra.faults = Object.assign({}, f, { clearing: true, confirmClear: false, note: null, warn: false });
             var cleared = 0, failed = 0;
             todo.reduce(function (p, u) {
@@ -343,94 +426,51 @@ mgu.run({
                 if (failed) parts.push(failed + ' ohne Bestätigung');
                 if (skipped.length) parts.push('Headunit ausgelassen');
                 log.info('Fehler geloescht: ' + cleared + ', ohne Bestaetigung: ' + failed);
+                clearing = false;
                 extra.faults = { reading: false };
                 readFaults(parts.join(', ') + '.');
             });
         }
 
+        // ---- Logs / Aufnahme ----
         function showLogs() { try { extra.logs = logbook.list().map(function (l) { return logbook.summary(l.name); }).filter(Boolean); } catch (e) { extra.logs = []; } }
         function openLog(i) {
             var l = extra.logs && extra.logs[i];
             if (!l) return;
-            try { extra.log = logbook.load(l.name); extra.channel = 'rpm'; page = 'log'; } catch (e) { log.warn('log load: ' + e); }
+            try { extra.log = logbook.load(l.name); extra.logName = l.name; extra.channel = 'rpm'; extra.confirmDelete = false; page = 'log'; } catch (e) { log.warn('log load: ' + e); }
+        }
+        function stopRecording() {
+            if (!rec) return;
+            try { rec.stop(); } catch (e) { log.warn('aufnahme stop: ' + e); }
+            rec = null; extra.recording = null; showLogs();
         }
         function toggleRecord() {
-            if (rec) { try { rec.stop(); } catch (e) { } rec = null; extra.recording = null; showLogs(); }
-            else { rec = new logbook.Recording(clock.wall()); recStart = Date.now(); }
+            if (rec) { stopRecording(); return; }
+            try { rec = new logbook.Recording(); extra.recording = { ms: 0 }; }       // ohne Argument wie die M2-App (ms intern)
+            catch (e) { rec = null; log.warn('aufnahme start: ' + e); }
         }
-        setInterval(function () {
-            if (rec) { try { rec.sample(lastV || {}, Date.now()); } catch (e) { } extra.recording = { ms: Date.now() - recStart }; }
-        }, 100);
 
         function onEnter(p) {
             if (p === 'faults') { if (!extra.faults || (!extra.faults.reading && !extra.faults.scan)) readFaults(); }
             else if (p === 'logs') { showLogs(); }
-            else if (p === 'records') { extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm }; }
+        }
+        function resetConfirms() {
+            recordsConfirm = false; extra.confirmDelete = false; extra.confirmDeleteAll = false; extra.usb = null;
+            if (extra.faults && extra.faults.confirmClear) extra.faults = Object.assign({}, extra.faults, { confirmClear: false });
+            if (cooling.confirm) cooling = Object.assign({}, cooling, { confirm: false });
         }
 
-        // ---- Render: dash.js (2880x764) in die 1600x520-Zelle einpassen ----
-        var dstW = 1600, dstH = 520;
-        var fitW = dstW, fitH = Math.round(dstW * SH / SW), fitY = Math.round((dstH - fitH) / 2);
-        var bg = dash.C.asphalt;
-        var pressedId = null;
-
-        // Das Bild geht als Pixelbild (setImage) in einen Kit-Recorder: so fuehrt das Kit den Bildschirm
-        // (GPU-Renderer), und die Ziele (cv.target) bekommen Antippen und Dreh-Drueck-Steller. Ein blosses
-        // Canvas/PNG landete im festen Bildfeld der HMI - dort kam keine Eingabe an (Feldtest 0.2.0).
-        var IMG_ID = 0x4D44;   // 'MD'
-        ctx.loop('MAIN', 4, function () {
-            var v = buildV(); glide(v); lastV = v;
-            // Max-Cooling-Knopf nur, wenn MHD erkannt ist und die Option an ist
-            extra.cooling = (mhd === true && cfg.mhdCoolingOn) ? Object.assign({}, cooling) : null;
-            if (page === 'records') { extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm }; }
-            var src = new KitCanvas(SW, SH);
-            try { dash.draw(src, page, v, cfg, { focus: null, pressed: pressedId }, extra); }
-            catch (e) { log.warn('draw ' + page + ': ' + e); }
-            var small = new KitCanvas(fitW, fitH);
-            blitScaled(small, src, 0, fitW, fitH);
-            setImage(IMG_ID, fitW, fitH, small.d);
-            var cv = ctx.canvas(dstW, dstH).clear(bg);
-            cv.image(IMG_ID, 0, fitY, fitW, fitH);
-            // jedes antippbare Feld von dash.js (Tabs, Knoepfe) als Ziel - umgerechnet auf 1600x520
-            var tg = [];
-            try { tg = dash.targets(page, extra) || []; } catch (e) { log.warn('targets ' + page + ': ' + e); }
-            tg.forEach(function (t) {
-                var id = t.id;
-                cv.target(t.x * fitW / SW, fitY + t.y * fitH / SH, t.w * fitW / SW, t.h * fitH / SH,
-                    function () { act(id); }, id);
-            });
-            return ui.image('MAIN_GFX', cv);
-        });
-
-        function blitScaled(dst, src, y0, w, h) {
-            var d = dst.d, s = src.d, fx = src.w / w, fy = src.h / h;
-            for (var py = 0; py < h; py++) {
-                var sy = Math.min(src.h - 1, (py * fy) | 0) * src.w;
-                var di = ((py + y0) * dst.w) * 4;
-                for (var px = 0; px < w; px++, di += 4) {
-                    var si = (sy + Math.min(src.w - 1, (px * fx) | 0)) * 4;
-                    d[di] = s[si]; d[di + 1] = s[si + 1]; d[di + 2] = s[si + 2]; d[di + 3] = 255;
-                }
-            }
-        }
-
-        // ---- Eingabe: Tippen -> dash-Koordinaten -> Ziel -> Aktion ----
+        // ---- Eingabe: Aktion zu einem dash-Ziel ----
         function act(id) {
-            if (id.indexOf('tab:') === 0) {
-                // ein Seitenwechsel nimmt offene Bestaetigungen zurueck (wie die M2-App)
-                recordsConfirm = false; extra.confirmDelete = false; extra.confirmDeleteAll = false; extra.usb = null;
-                if (extra.faults && extra.faults.confirmClear) extra.faults = Object.assign({}, extra.faults, { confirmClear: false });
-                page = id.slice(4); onEnter(page); return;
-            }
+            if (id.indexOf('tab:') === 0) { resetConfirms(); page = id.slice(4); onEnter(page); return; }
             if (id.indexOf('menu:') === 0) { page = id.slice(5); return; }
             if (id === 'settings:back') { page = 'settings'; return; }
             if (id === 'reset') { peak = {}; trip = {}; return; }
             if (id === 'record') { toggleRecord(); return; }
-            // MHD Max Cooling
             if (id === 'cooling' || id === 'cooling!') { coolingPressed(); return; }
-            // Fehlerspeicher
             if (id === 'faults:read') { readFaults(); return; }
             if (id === 'faults:clear') {
+                if (clearing || faultsBusy) return;
                 var why = clearBlocked(), f = extra.faults || {};
                 extra.faults = why ? Object.assign({}, f, { note: why, warn: true, confirmClear: false })
                     : Object.assign({}, f, { confirmClear: true, note: null, warn: false });
@@ -439,26 +479,80 @@ mgu.run({
             if (id === 'faults:clear!') { clearFaults(); return; }
             if (id.indexOf('unit:') === 0) { extra.unit = parseInt(id.slice(5), 10); page = 'faultunit'; return; }
             if (id === 'faults:back') { page = 'faults'; return; }
-            // Rekorde (mit Bestaetigung)
             if (id === 'records:clear') { recordsConfirm = true; return; }
-            if (id === 'records:clear!') { records.clear(); recordsConfirm = false; return; }
-            // Logs (Loeschen mit Bestaetigung)
-            if (id.indexOf('open:') === 0) { openLog(parseInt(id.slice(5), 10)); extra.confirmDelete = false; return; }
+            if (id === 'records:clear!') { if (recordsConfirm) records.clear(); recordsConfirm = false; return; }
+            if (id.indexOf('open:') === 0) { openLog(parseInt(id.slice(5), 10)); return; }
             if (id.indexOf('chan:') === 0) { extra.channel = id.slice(5); return; }
             if (id === 'delete') { extra.confirmDelete = true; return; }
-            if (id === 'delete!') { if (extra.log) { try { logbook.remove(extra.log.name); } catch (e) { } } extra.confirmDelete = false; page = 'logs'; showLogs(); return; }
+            if (id === 'delete!') { if (extra.confirmDelete && extra.logName) { try { logbook.remove(extra.logName); } catch (e) { } } extra.confirmDelete = false; extra.log = null; page = 'logs'; showLogs(); return; }
             if (id === 'deleteAll') { extra.confirmDeleteAll = true; return; }
-            if (id === 'deleteAll!') { try { logbook.removeAll(); } catch (e) { } extra.confirmDeleteAll = false; showLogs(); return; }
-            if (id === 'back') { page = (page === 'faultunit') ? 'faults' : 'logs'; return; }
+            if (id === 'deleteAll!') { if (extra.confirmDeleteAll) { try { logbook.removeAll(); } catch (e) { } } extra.confirmDeleteAll = false; showLogs(); return; }
+            if (id === 'back') { page = (page === 'faultunit') ? 'faults' : 'logs'; if (page === 'logs') showLogs(); return; }
             if (id === 'usb') { extra.usb = { text: 'USB-Export auf iDrive 7 nicht verfügbar.' }; return; }
-            // Grenzwerte / Einstellungen (gespeichert)
             if (id.indexOf('dec:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), -1); saveCfg(); return; }
             if (id.indexOf('inc:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), 1); saveCfg(); return; }
             if (id.indexOf('toggle:') === 0) { cfg = Limits.toggled(cfg, id.slice(7)); saveCfg(); return; }
             if (id === 'defaults') { cfg = Limits.reset(cfg, page === 'ready' ? 'ready' : 'limits'); saveCfg(); return; }
         }
-        // Antippen + Dreh-Drueck-Steller laufen ueber die Ziele im Recorder (cv.target -> act), siehe Render-Schleife.
-        ctx.onBack && ctx.onBack(function () { if (page !== 'main') { page = 'main'; return true; } });
+
+        // ---- Zeichnen: dash.js als Vektor in den Kit-Recorder ----
+        // Umleiter fuer dash.js: dieselben 7 Zeichenbefehle, von dash-Koordinaten (2880x764) auf die Seite
+        // skaliert (selbst, nicht per cv.xf: xf heisst im Kit "nur GPU" - ohne Renderer bliebe die Seite leer),
+        // Texte woertlich (keine Kit-Uebersetzung) in unseren Schriften. Breiten gehen in dash-Einheiten zurueck.
+        function painter(cv) {
+            var X = function (x) { return OX + x * K; }, Y = function (y) { return OY + y * K; }, S = function (v) { return v * K; };
+            var opts = function (o) {
+                var r = {}; if (o) { for (var k in o) r[k] = o[k]; }
+                r.font = FONT[r.font || 'label'] || 'md_label'; r.literal = true;
+                if (r.spacing) r.spacing = S(r.spacing);
+                return r;
+            };
+            var P = {
+                w: SW, h: SH,
+                clear: function (c) { cv.fillRect(OX, OY, S(SW), S(SH), c); return P; },
+                fillRect: function (x, y, w, h, c) { cv.fillRect(X(x), Y(y), S(w), S(h), c); return P; },
+                roundRect: function (x, y, w, h, r, c) { cv.roundRect(X(x), Y(y), S(w), S(h), S(r), c); return P; },
+                strokeRoundRect: function (x, y, w, h, r, lw, c) { cv.strokeRoundRect(X(x), Y(y), S(w), S(h), S(r), S(lw), c); return P; },
+                polyline: function (pts, lw, c) { cv.polyline(pts.map(function (p) { return [X(p[0]), Y(p[1])]; }), S(lw), c); return P; },
+                text: function (s, x, y, size, c, o) { return cv.text(s, X(x), Y(y), S(size), c, opts(o)) / K; },
+                textWidth: function (s, size, o) { return cv.textWidth(s, S(size), opts(o)) / K; }
+            };
+            return P;
+        }
+        var bg = dash.C.asphalt;
+        ctx.loop('MAIN', 15, function () {
+            var now = Date.now();
+            if (now - lastDraw < DRAW_MS && lastV) return;                     // GPU-Renderer tickt bis 60/s: begrenzen
+            lastDraw = now;
+            if (!lastV) lastV = buildV();
+            var v = Object.assign({}, lastV); glide(v);
+            // Max-Cooling-Knopf nur, wenn MHD erkannt ist und die Option an ist
+            extra.cooling = (mhd === true && cfg.mhdCoolingOn) ? Object.assign({}, cooling) : null;
+            if (page === 'records') extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm };
+            var cv = ctx.canvas(1600, 520).clear(bg);
+            try { dash.draw(painter(cv), page, v, cfg, { focus: null, pressed: null }, extra); }
+            catch (e) { log.warn('draw ' + page + ': ' + e); }
+            // jedes antippbare Feld als Kit-Ziel (Seiten-Pixel); Schluessel ohne "!", damit der Controller-Fokus
+            // beim Bestaetigen (cooling -> cooling!) auf dem Knopf bleibt
+            var tg = [];
+            try { tg = dash.targets(page, extra) || []; } catch (e) { log.warn('targets ' + page + ': ' + e); }
+            tg.forEach(function (t) {
+                var id = t.id;
+                cv.target(OX + t.x * K, OY + t.y * K, t.w * K, t.h * K, function () { act(id); }, id.replace(/!$/, ''));
+            });
+            return ui.image('MAIN_GFX', cv);
+        });
+
+        // Beim Verlassen offene Bestaetigungen zurueck; beim Wiederkommen gleich eine Runde
+        ui.onVisible(function (name, vis) {
+            if (name !== 'MAIN') return;
+            if (!vis) resetConfirms(); else { try { sampleOnce(); } catch (e) { } }
+        });
+        // Beim Beenden noch speichern (die Laufzeit beendet den Prozess selbst)
+        process.on('exit', function () {
+            try { records.flush(); } catch (e) { }
+            try { if (rec) rec.stop(); } catch (e) { }
+        });
 
         log.info('Motordaten (ID7) gestartet');
     }
