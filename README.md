@@ -3,19 +3,22 @@
 **Motordaten** als App für BMW mit **iDrive 7 (MGU)** – dieselbe App wie die
 Motordaten-App für den G87 M2 (iDrive 8), nur auf dem MGU App Kit. Zeigt live die
 Werte der Motorsteuerung: Drehzahl, Öl-/Kühlmittel-/Ansaug-/Abgas-/Getriebe­temperatur,
-Lade- und Öldruck, Last, Leistung/Drehmoment, Klopfen, Bordnetz. **Nur lesend.**
+Lade- und Öldruck, Last, Leistung/Drehmoment, Klopfen, Bordnetz.
 
 Angelegt für einen G20 (B58, Benziner G-Serie). Installiert und aktualisiert über
 den [mgu-store](https://github.com/robertnisipeanu/mgu-store).
 
 ## Stand
 
-- **Live-Seite:** fertig, 1:1 das Design der iDrive-8-App (Tab-Leiste Live /
-  Maximalwerte / Logs / Fehler / Einstellungen, Drehzahlband, Gauges, Spitzenwerte).
-- **In Arbeit:** die Tabs Fehler (Fehlerspeicher lesen, 19 02), Logs und
-  Maximalwerte mit Live-Daten.
-- **Nicht enthalten (anders als die M2-App):** Schreib-Aktionen. „Max Cooling" und
-  „Fehlerspeicher löschen" schreiben ins Steuergerät – das macht diese App nicht.
+- **Alle Seiten wie die iDrive-8-App:** Live, Maximalwerte, Logs, Fehler,
+  Einstellungen (Tab-Leiste, Drehzahlband, Gauges, Spitzenwerte, Rekorde).
+- **MHD Max Cooling:** Die App erkennt selbst, ob die DME mit MHD läuft (einmalige
+  harmlose Abfrage „Max Cooling aus") und zeigt den Knopf nur dann. Einschalten nur
+  bei laufendem Motor. Abschaltbar unter Einstellungen.
+- **Fehlerspeicher:** lesen bei allen Steuergeräten; **löschen** nur bei Zündung an
+  und Motor aus, mit Bestätigung, Steuergerät für Steuergerät, nie die Headunit.
+- Nicht vorhanden: USB-Export der Logs (auf iDrive 7 nicht verfügbar).
+- Gilt für G-Serie-Benziner mit DME8FF_R, also **B58 und S58** (auch B48/B38).
 
 ## Installieren
 
@@ -28,36 +31,41 @@ den [mgu-store](https://github.com/robertnisipeanu/mgu-store).
 ```
 apps/km_motordaten/
   app.json        Manifest: Signale (CDS, InternalTasu), Screen, Einstellungen
-  main.js         Kit-Einstieg: Werte-Loop (UDS 0x22), Render dash.js → Bild
-  dme.js          (Reserve) Werte als DID-Kandidaten im Kit-Format
-  md/             die Zeichen-/Logik-Module der iDrive-8-App (dash, decode,
-                  limits, faults, logbook, records, kit_canvas …), 1:1 übernommen
+  main.js         Kit-Einstieg: Werte-Loop (UDS 0x22), MHD-Erkennung, Max Cooling,
+                  Fehler lesen/löschen, Render dash.js → Bild, Eingabe
+  dash.js, decode.js, limits.js, faults.js, logbook.js, records.js, kit_canvas.js …
+                  die Zeichen-/Logik-Module der iDrive-8-App, 1:1 übernommen
+                  (flach im App-Ordner, weil der Build alle Module flach ablegt)
   icon.png
-kit/              MGU App Kit (fremd, MIT – siehe kit/UPSTREAM.md)
+kit/              MGU App Kit (fremd, MIT – siehe kit/UPSTREAM_COMMIT)
+mgu-repo.json     sagt dem Store: Apps unter apps/*, Build mit kit/tools/build.py,
+                  dazu die Tools GPU-Renderer und Controller-Gate
 ```
 
 ## Technik, kurz
 
-Die iDrive-7-Oberfläche kennt keine App-Umgebung wie der Store sie fürs Zeichnen
-braucht – deshalb zeichnet `md/dash.js` die Seiten als Bild (2880×764), das in den
+`dash.js` zeichnet die Seiten als Bild (2880×764, wie am M2), das in den
 ID7-Bildbereich (1600×520) eingepasst und über `ui.image` ausgegeben wird. Die
 Werte liest `main.js` per UDS-Diagnose (`0x22 ReadDataByIdentifier`) aus der DME
 (0x12), dem Getriebe (EGS 0x18) und einer OBD-PID – über `kit/diag.js`, dekodiert
-mit `md/decode.js` (DME8FF_R, B58/B48/B38).
+mit `decode.js` (DME8FF_R). Alle Diagnose-Anfragen laufen nacheinander über eine
+Warteschlange, damit ein Schreibbefehl nie mit dem Polling kollidiert.
 
 ## Grundlagen und Lizenzen
 
 - `kit/` – **MGU App Kit** aus
   [cauliflowermossgrape/idrive7-apps](https://github.com/cauliflowermossgrape/idrive7-apps)
-  (MIT), getrimmt; Vorlage für den App-Aufbau war dort `car_vitals`.
-- `md/` – unsere eigenen Module aus
+  (MIT), vollständig übernommen (Renderer + Controller-Gate werden mitinstalliert);
+  Vorlage für den App-Aufbau war dort `car_vitals`.
+- Die Zeichen-/Logik-Module (`dash.js` usw.) – unsere eigenen aus
   [Prototype019/motordaten](https://github.com/Prototype019/motordaten) (iDrive-8-App).
 - DID-Tabellen/Decodierung aus dem genannten `idrive7-apps`-Projekt (DME8FF_R, aus
   der öffentlichen EdiabasX-Referenz).
 
 ## Rechtliches
 
-Arbeit am eigenen Fahrzeug, nur lesend (keine Schreibzugriffe aufs Steuergerät).
+Arbeit am eigenen Fahrzeug. Schreibzugriffe gibt es genau zwei, beide vom Fahrer
+ausgelöst: MHD Max Cooling (nur mit MHD-DME) und Fehlerspeicher löschen.
 Enthält keine BMW-Software und keine Fahrzeug-Identdaten.
 
 ## Lizenz

@@ -7,11 +7,19 @@
  * passen sie in den ID7-Bildbereich (1600x520) ein und uebergeben das Bild.
  * Werte liest es per UDS-Diagnose (0x22) aus der DME (0x12), dem Getriebe
  * (EGS 0x18) und einer OBD-PID - ueber kit/diag.js, dekodiert mit decode.js
- * (DME8FF_R, B58). Fehlerspeicher wird nur gelesen (19 02). NUR LESEND: die
- * Schreib-Aktionen der M2-App (Max Cooling, Fehlerspeicher loeschen) sind aus.
+ * (DME8FF_R, B58/S58). Fehlerspeicher lesen: 19 02 an alle Steuergeraete.
+ *
+ * Zwei Schreib-Aktionen wie in der M2-App, mit denselben Schutzregeln:
+ *  - MHD Max Cooling (2F 03 01/00 nur an die DME): die App erkennt selbst, ob die
+ *    DME mit MHD laeuft (einmalige Abfrage "Max Cooling aus", Echo 6F 03 00), und
+ *    zeigt den Knopf nur dann. An nur bei laufendem Motor (> 500 U/min).
+ *  - Fehlerspeicher loeschen (14 FF FF FF): nur Zuendung an + Motor aus, mit
+ *    Bestaetigung, Steuergeraet fuer Steuergeraet, nie die Headunit (0x63).
  *
  * iDrive-7-Laufzeit = Node 8: kein ?./??/Spread/import/Klassenfelder.
  */
+var fs = require('fs');
+var path = require('path');
 var mgu = require('./kit/mgu');
 var Car = require('./kit/car');
 var Diag = require('./kit/diag').Diag;
@@ -53,7 +61,23 @@ mgu.run({
 
         if (ctx.dataDir) { try { process.env.KM_DATA_DIR = ctx.dataDir; } catch (e) { } }
 
-        var cfg = Limits.defaults();
+        var dataDir = process.env.KM_DATA_DIR || '';
+        var cfg = Limits.load();                      // Grenzwerte, gespeichert in data/limits.json
+        function saveCfg() { try { Limits.save(cfg); } catch (e) { log.warn('limits save: ' + e); } }
+
+        // MHD: einmal erkannt -> in data/mhd.json gemerkt (dann keine erneute Abfrage)
+        var MHD_FILE = dataDir ? path.join(dataDir, 'mhd.json') : null;
+        var mhd = null;                               // true = MHD erkannt, false = DME kennt die Routine nicht, null = offen
+        try { if (MHD_FILE && JSON.parse(fs.readFileSync(MHD_FILE, 'utf8')).mhd === true) mhd = true; } catch (e) { }
+        function saveMhd() { try { if (MHD_FILE) fs.writeFileSync(MHD_FILE, JSON.stringify({ mhd: true, at: Date.now() })); } catch (e) { } }
+        var cooling = { state: null }, coolingTimer = null;
+        var probeAt = 0, probeTries = 0;
+        var recordsConfirm = false;
+
+        // Alle Diagnose-Anfragen nacheinander (Polling, Fehler lesen, Schreibbefehle)
+        var chain = Promise.resolve();
+        function serial(fn) { var p = chain.then(fn, fn); chain = p.then(function () { }, function () { }); return p; }
+
         var m = {}, mAt = {};
         var cds = { oil: null, coolant: null, rpm: null };
         var peak = {}, trip = {}, startedAt = 0, running = false;
@@ -103,16 +127,38 @@ mgu.run({
         function sampleOnce() {
             if (sampling || !diagReady || !link.p || faultsBusy) { return Promise.resolve(); }
             sampling = true; round++;
-            var seq = readGroup(DME, FAST);
-            if (round % 2 === 0) { seq = seq.then(function () { return readGroup(DME, KNOCK); }); }
-            if (round % 6 === 0) {
-                seq = seq.then(function () { return readGroup(DME, SLOW); })
-                    .then(function () { return readGroup(DME, BATTERY); })
-                    .then(readEgs).then(readVoltage);
-            }
-            return seq.then(function () { sampling = false; }, function () { sampling = false; });
+            return serial(function () {
+                var seq = readGroup(DME, FAST);
+                if (round % 2 === 0) { seq = seq.then(function () { return readGroup(DME, KNOCK); }); }
+                if (round % 6 === 0) {
+                    seq = seq.then(function () { return readGroup(DME, SLOW); })
+                        .then(function () { return readGroup(DME, BATTERY); })
+                        .then(readEgs).then(readVoltage);
+                }
+                return seq;
+            }).then(function () { sampling = false; probeMhd(); }, function () { sampling = false; });
         }
         setInterval(function () { sampleOnce(); }, CYCLE_MS);
+
+        // ---- MHD erkennen: die DME einmal harmlos fragen (Max Cooling AUS = 2F 03 00) ----
+        // Echo 6F 03 00 -> die DME laeuft mit MHD-Code. NRC "Dienst/ID unbekannt" -> kein MHD.
+        // Keine oder andere Antwort -> spaeter nochmal (hoechstens 5 Versuche, alle 20 s).
+        var accCool = function (u) { return (u[0] === 0x6F && u[1] === 0x03) || (u[0] === 0x7F && u[1] === 0x2F); };
+        var probing = false;
+        function probeMhd() {
+            if (mhd !== null || probing || probeTries >= 5 || !isNum(m.rpm) || Date.now() - probeAt < 20000) return;
+            probing = true; probeAt = Date.now(); probeTries++;
+            serial(function () { return link.physical(DME, 0x2F, [0x03, 0x00], 2500, accCool); }).then(function (u) {
+                probing = false;
+                if (u && u[0] === 0x6F && u[1] === 0x03 && u[2] === 0x00) {
+                    mhd = true; saveMhd(); cooling.state = 'OFF';
+                    if (!cfg.mhdCoolingOn) { cfg.mhdCoolingOn = 1; saveCfg(); }   // beim ersten Erkennen einschalten
+                    log.info('MHD erkannt: Max Cooling verfuegbar');
+                } else if (u && u[0] === 0x7F && (u[2] === 0x11 || u[2] === 0x12 || u[2] === 0x31)) {
+                    mhd = false; log.info('kein MHD (DME: ' + u[2].toString(16) + ')');
+                }
+            }, function () { probing = false; });
+        }
 
         car.onSample(function () {
             var d = car.data();
@@ -191,7 +237,7 @@ mgu.run({
             }
 
             var allNull = FAST.every(function (id) { return !isNum(m[KEYOF[id]]); });
-            if (diagReady && link.p && round > 2 && allNull) { v.status = 'Keine Antwort der DME - Zuendung an?'; v.statusErr = false; }
+            if (diagReady && link.p && round > 2 && allNull) { v.status = 'Keine Antwort der DME – Zündung an?'; v.statusErr = false; }
             else { v.status = ''; v.statusErr = false; }
             return v;
         }
@@ -209,14 +255,14 @@ mgu.run({
         }
 
         // ---- Fehlerspeicher lesen (nur lesend, 19 02 an alle Steuergeraete) ----
-        function readFaults() {
+        function readFaults(note) {
             if (faultsBusy || !diagReady || !link.p) return;
             faultsBusy = true;
             var addrs = faults.addresses();
             var scan = addrs.map(function (a) { return { addr: a, name: faults.unitName(a), state: 'wait', entries: [] }; });
             extra.faults = { reading: true, scan: scan, progress: 0 };
             var replied = {};
-            link.functional(0x19, [0x02, 0x0D], { maxMs: 7000, onReply: function () { extra.faults.progress = (extra.faults.progress || 0) + 1; } })
+            serial(function () { return link.functional(0x19, [0x02, 0x0D], { maxMs: 7000, onReply: function () { extra.faults.progress = (extra.faults.progress || 0) + 1; } }); })
                 .then(function (map) {
                     var reps = new Map();
                     if (map && map.forEach) { map.forEach(function (uds, ecu) { reps.set(ecu, uds); replied[ecu] = 1; }); }
@@ -227,12 +273,78 @@ mgu.run({
                         u.entries = entries.filter(function (e) { return e.ecu === u.addr; });
                         u.state = replied[u.addr] ? (u.entries.length ? 'faults' : 'ok') : 'none';
                     }
-                    extra.faults = { scan: scan, units: addrs.length, entries: entries, at: new Date() };
+                    extra.faults = { scan: scan, units: addrs.length, entries: entries, at: new Date(), note: note || null };
                     faultsBusy = false;
                 }, function (e) {
                     extra.faults = { scan: scan, units: addrs.length, entries: [], at: new Date(), error: String(e && e.message || e) };
                     faultsBusy = false;
                 });
+        }
+
+        // ---- MHD Max Cooling (wie die M2-App): an nur bei laufendem Motor, aus jederzeit ----
+        var COOLING_MIN_RPM = 500;
+        function coolingNote(note) {
+            clearTimeout(coolingTimer);
+            cooling = Object.assign({}, cooling, { note: note, confirm: false });
+            coolingTimer = setTimeout(function () { cooling = Object.assign({}, cooling, { note: null }); }, 3000);
+        }
+        function sendCooling(on) {
+            if (mhd !== true || !cfg.mhdCoolingOn || cooling.busy) return;
+            var rpm = lastV && lastV.rpm;
+            if (on && !(isNum(rpm) && rpm > COOLING_MIN_RPM)) { coolingNote('Erst Motor starten'); return; }
+            clearTimeout(coolingTimer);
+            cooling = Object.assign({}, cooling, { busy: true, confirm: false, note: null });
+            var want = on ? 0x01 : 0x00;
+            serial(function () { return link.physical(DME, 0x2F, [0x03, want], 2500, accCool); }).then(function (u) {
+                var echoed = !!(u && u[0] === 0x6F && u[1] === 0x03 && u[2] === want);
+                cooling = { state: echoed ? (on ? 'ON' : 'OFF') : cooling.state, busy: false };
+                log.info('MHD Max Cooling ' + (on ? 'an' : 'aus') + ': ' + (echoed ? 'bestaetigt' : 'keine Bestaetigung'));
+                if (!echoed) coolingNote('Kein MHD-Echo');
+            }, function (e) {
+                cooling = Object.assign({}, cooling, { busy: false });
+                coolingNote('Nicht gesendet');
+                log.warn('max cooling: ' + (e && e.message));
+            });
+        }
+        function coolingPressed() {
+            if (mhd !== true || !cfg.mhdCoolingOn || cooling.busy) return;
+            sendCooling(cooling.state !== 'ON');
+        }
+
+        // ---- Fehlerspeicher loeschen (wie die M2-App): nur Zuendung an + Motor aus, mit Bestaetigung,
+        // Steuergeraet fuer Steuergeraet (14 FF FF FF), nie die Headunit (0x63). Danach neu lesen. ----
+        var NO_CLEAR = [0x63];
+        var acc14 = function (u) { return u[0] === 0x54 || (u[0] === 0x7F && u[1] === 0x14); };
+        function clearBlocked() {
+            var fresh = Date.now() - (mAt.rpm || 0) < 3000;
+            var rpm = fresh ? m.rpm : cds.rpm;
+            if (!isNum(rpm)) return 'Löschen nur bei Zündung an: keine Drehzahl vom Motor.';
+            if (rpm >= 200) return 'Löschen nur bei Motor aus. Motor abstellen, Zündung an lassen.';
+            return null;
+        }
+        function clearFaults() {
+            var f = extra.faults || {};
+            var why = clearBlocked();
+            if (why) { extra.faults = Object.assign({}, f, { note: why, warn: true, confirmClear: false }); return; }
+            var units = [];
+            (f.entries || []).forEach(function (e) { if (units.indexOf(e.ecu) < 0) units.push(e.ecu); });
+            var skipped = units.filter(function (u) { return NO_CLEAR.indexOf(u) >= 0; });
+            var todo = units.filter(function (u) { return NO_CLEAR.indexOf(u) < 0; });
+            extra.faults = Object.assign({}, f, { clearing: true, confirmClear: false, note: null, warn: false });
+            var cleared = 0, failed = 0;
+            todo.reduce(function (p, u) {
+                return p.then(function () {
+                    return serial(function () { return link.physical(u, 0x14, [0xFF, 0xFF, 0xFF], 8000, acc14); })
+                        .then(function (r) { if (r && r[0] === 0x54) cleared++; else failed++; }, function () { failed++; });
+                });
+            }, Promise.resolve()).then(function () {
+                var parts = ['Gelöscht in ' + cleared + ' ' + (cleared === 1 ? 'Steuergerät' : 'Steuergeräten')];
+                if (failed) parts.push(failed + ' ohne Bestätigung');
+                if (skipped.length) parts.push('Headunit ausgelassen');
+                log.info('Fehler geloescht: ' + cleared + ', ohne Bestaetigung: ' + failed);
+                extra.faults = { reading: false };
+                readFaults(parts.join(', ') + '.');
+            });
         }
 
         function showLogs() { try { extra.logs = logbook.list().map(function (l) { return logbook.summary(l.name); }).filter(Boolean); } catch (e) { extra.logs = []; } }
@@ -252,7 +364,7 @@ mgu.run({
         function onEnter(p) {
             if (p === 'faults') { if (!extra.faults || (!extra.faults.reading && !extra.faults.scan)) readFaults(); }
             else if (p === 'logs') { showLogs(); }
-            else if (p === 'records') { extra.maxima = { trip: trip, rec: records.best }; }
+            else if (p === 'records') { extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm }; }
         }
 
         // ---- Render: dash.js (2880x764) in die 1600x520-Zelle einpassen ----
@@ -263,7 +375,9 @@ mgu.run({
 
         ctx.loop('MAIN', 4, function () {
             var v = buildV(); glide(v); lastV = v;
-            if (page === 'records') { extra.maxima = { trip: trip, rec: records.best }; }
+            // Max-Cooling-Knopf nur, wenn MHD erkannt ist und die Option an ist
+            extra.cooling = (mhd === true && cfg.mhdCoolingOn) ? Object.assign({}, cooling) : null;
+            if (page === 'records') { extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm }; }
             var src = new KitCanvas(SW, SH);
             try { dash.draw(src, page, v, cfg, { focus: null, pressed: pressedId }, extra); }
             catch (e) { log.warn('draw ' + page + ': ' + e); }
@@ -286,28 +400,47 @@ mgu.run({
         }
 
         // ---- Eingabe: Tippen -> dash-Koordinaten -> Ziel -> Aktion ----
-        var WRITE = { cooling: 1, 'cooling!': 1, 'faults:clear': 1, 'faults:clear!': 1 };
         function act(id) {
-            if (WRITE[id]) { log.info('Schreib-Aktion auf ID7 aus: ' + id); return; }
-            if (id.indexOf('tab:') === 0) { page = id.slice(4); onEnter(page); return; }
+            if (id.indexOf('tab:') === 0) {
+                // ein Seitenwechsel nimmt offene Bestaetigungen zurueck (wie die M2-App)
+                recordsConfirm = false; extra.confirmDelete = false; extra.confirmDeleteAll = false; extra.usb = null;
+                if (extra.faults && extra.faults.confirmClear) extra.faults = Object.assign({}, extra.faults, { confirmClear: false });
+                page = id.slice(4); onEnter(page); return;
+            }
             if (id.indexOf('menu:') === 0) { page = id.slice(5); return; }
             if (id === 'settings:back') { page = 'settings'; return; }
             if (id === 'reset') { peak = {}; trip = {}; return; }
             if (id === 'record') { toggleRecord(); return; }
+            // MHD Max Cooling
+            if (id === 'cooling' || id === 'cooling!') { coolingPressed(); return; }
+            // Fehlerspeicher
             if (id === 'faults:read') { readFaults(); return; }
+            if (id === 'faults:clear') {
+                var why = clearBlocked(), f = extra.faults || {};
+                extra.faults = why ? Object.assign({}, f, { note: why, warn: true, confirmClear: false })
+                    : Object.assign({}, f, { confirmClear: true, note: null, warn: false });
+                return;
+            }
+            if (id === 'faults:clear!') { clearFaults(); return; }
             if (id.indexOf('unit:') === 0) { extra.unit = parseInt(id.slice(5), 10); page = 'faultunit'; return; }
             if (id === 'faults:back') { page = 'faults'; return; }
-            if (id === 'records:clear' || id === 'records:clear!') { records.clear(); return; }
-            if (id.indexOf('open:') === 0) { openLog(parseInt(id.slice(5), 10)); return; }
+            // Rekorde (mit Bestaetigung)
+            if (id === 'records:clear') { recordsConfirm = true; return; }
+            if (id === 'records:clear!') { records.clear(); recordsConfirm = false; return; }
+            // Logs (Loeschen mit Bestaetigung)
+            if (id.indexOf('open:') === 0) { openLog(parseInt(id.slice(5), 10)); extra.confirmDelete = false; return; }
             if (id.indexOf('chan:') === 0) { extra.channel = id.slice(5); return; }
-            if (id === 'delete' || id === 'delete!') { if (extra.log) { try { logbook.remove(extra.log.name); } catch (e) { } } page = 'logs'; showLogs(); return; }
-            if (id === 'deleteAll' || id === 'deleteAll!') { try { logbook.removeAll(); } catch (e) { } showLogs(); return; }
+            if (id === 'delete') { extra.confirmDelete = true; return; }
+            if (id === 'delete!') { if (extra.log) { try { logbook.remove(extra.log.name); } catch (e) { } } extra.confirmDelete = false; page = 'logs'; showLogs(); return; }
+            if (id === 'deleteAll') { extra.confirmDeleteAll = true; return; }
+            if (id === 'deleteAll!') { try { logbook.removeAll(); } catch (e) { } extra.confirmDeleteAll = false; showLogs(); return; }
             if (id === 'back') { page = (page === 'faultunit') ? 'faults' : 'logs'; return; }
-            if (id === 'usb') { extra.usb = { text: 'USB-Export auf iDrive 7 nicht verfuegbar.' }; return; }
-            if (id.indexOf('dec:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), -1); return; }
-            if (id.indexOf('inc:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), 1); return; }
-            if (id.indexOf('toggle:') === 0) { cfg = Limits.toggled(cfg, id.slice(7)); return; }
-            if (id === 'defaults') { cfg = Limits.reset(cfg, page === 'ready' ? 'ready' : 'limits'); return; }
+            if (id === 'usb') { extra.usb = { text: 'USB-Export auf iDrive 7 nicht verfügbar.' }; return; }
+            // Grenzwerte / Einstellungen (gespeichert)
+            if (id.indexOf('dec:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), -1); saveCfg(); return; }
+            if (id.indexOf('inc:') === 0) { cfg = Limits.stepped(cfg, id.slice(4), 1); saveCfg(); return; }
+            if (id.indexOf('toggle:') === 0) { cfg = Limits.toggled(cfg, id.slice(7)); saveCfg(); return; }
+            if (id === 'defaults') { cfg = Limits.reset(cfg, page === 'ready' ? 'ready' : 'limits'); saveCfg(); return; }
         }
         if (ctx.onTap) {
             ctx.onTap(function (x, y) {
