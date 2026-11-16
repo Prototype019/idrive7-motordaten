@@ -23,6 +23,7 @@ var path = require('path');
 var mgu = require('./kit/mgu');
 var Car = require('./kit/car');
 var Diag = require('./kit/diag').Diag;
+var setImage = require('./kit/record').setImage;
 
 var dash = require('./dash.js');
 var decode = require('./decode.js');
@@ -373,6 +374,10 @@ mgu.run({
         var bg = dash.C.asphalt;
         var pressedId = null;
 
+        // Das Bild geht als Pixelbild (setImage) in einen Kit-Recorder: so fuehrt das Kit den Bildschirm
+        // (GPU-Renderer), und die Ziele (cv.target) bekommen Antippen und Dreh-Drueck-Steller. Ein blosses
+        // Canvas/PNG landete im festen Bildfeld der HMI - dort kam keine Eingabe an (Feldtest 0.2.0).
+        var IMG_ID = 0x4D44;   // 'MD'
         ctx.loop('MAIN', 4, function () {
             var v = buildV(); glide(v); lastV = v;
             // Max-Cooling-Knopf nur, wenn MHD erkannt ist und die Option an ist
@@ -381,10 +386,20 @@ mgu.run({
             var src = new KitCanvas(SW, SH);
             try { dash.draw(src, page, v, cfg, { focus: null, pressed: pressedId }, extra); }
             catch (e) { log.warn('draw ' + page + ': ' + e); }
-            var out = new KitCanvas(dstW, dstH); out.clear(bg);
-            if (out.drawImage) { out.drawImage(src.d, SW, SH, 0, fitY, fitW, fitH); }
-            else { blitScaled(out, src, fitY, fitW, fitH); }
-            return ui.image('MAIN_GFX', out);
+            var small = new KitCanvas(fitW, fitH);
+            blitScaled(small, src, 0, fitW, fitH);
+            setImage(IMG_ID, fitW, fitH, small.d);
+            var cv = ctx.canvas(dstW, dstH).clear(bg);
+            cv.image(IMG_ID, 0, fitY, fitW, fitH);
+            // jedes antippbare Feld von dash.js (Tabs, Knoepfe) als Ziel - umgerechnet auf 1600x520
+            var tg = [];
+            try { tg = dash.targets(page, extra) || []; } catch (e) { log.warn('targets ' + page + ': ' + e); }
+            tg.forEach(function (t) {
+                var id = t.id;
+                cv.target(t.x * fitW / SW, fitY + t.y * fitH / SH, t.w * fitW / SW, t.h * fitH / SH,
+                    function () { act(id); }, id);
+            });
+            return ui.image('MAIN_GFX', cv);
         });
 
         function blitScaled(dst, src, y0, w, h) {
@@ -442,17 +457,7 @@ mgu.run({
             if (id.indexOf('toggle:') === 0) { cfg = Limits.toggled(cfg, id.slice(7)); saveCfg(); return; }
             if (id === 'defaults') { cfg = Limits.reset(cfg, page === 'ready' ? 'ready' : 'limits'); saveCfg(); return; }
         }
-        if (ctx.onTap) {
-            ctx.onTap(function (x, y) {
-                var dx = x * SW / fitW, dy = (y - fitY) * SH / fitH;
-                if (dy < 0 || dy > SH) return;
-                var tg = dash.targets(page, extra) || [];
-                for (var i = 0; i < tg.length; i++) {
-                    var t = tg[i];
-                    if (dx >= t.x && dx < t.x + t.w && dy >= t.y && dy < t.y + t.h) { act(t.id); return; }
-                }
-            });
-        }
+        // Antippen + Dreh-Drueck-Steller laufen ueber die Ziele im Recorder (cv.target -> act), siehe Render-Schleife.
         ctx.onBack && ctx.onBack(function () { if (page !== 'main') { page = 'main'; return true; } });
 
         log.info('Motordaten (ID7) gestartet');

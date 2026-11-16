@@ -2,7 +2,7 @@
   "id": "km_motordaten",
   "title": "Motordaten",
   "description": "Live-Motordaten der DME wie die M2-App: Temperaturen, Drücke, Drehzahl, Leistung, Klopfen; Maximalwerte, Logs, Fehlerspeicher lesen/löschen; MHD Max Cooling (wird automatisch erkannt).",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "vendor": "Prototype019",
   "loggingId": "KMD1",
   "iconGlyph": "gauge",
