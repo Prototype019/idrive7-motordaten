@@ -15,6 +15,13 @@ den [mgu-store](https://github.com/robertnisipeanu/mgu-store).
 - **MHD Max Cooling:** Die App erkennt selbst, ob die DME mit MHD läuft (einmalige
   harmlose Abfrage „Max Cooling aus") und zeigt den Knopf nur dann. Einschalten nur
   bei laufendem Motor. Abschaltbar unter Einstellungen.
+- **Live-Seite fürs iD7 (ab 0.4.0):** eigene, größere Aufteilung für den 10,25″-Bildschirm
+  (`dash7.js`): Drehzahl, Öltemperatur, Ladedruck, Öldruck groß, darunter die übrigen Werte.
+- **MHD-Abgasklappe (ab 0.4.0):** Knopf „Klappe: Auto / Auf / Zu" (`2F 02 00/01/02`, nur mit
+  MHD-Echo). „Zu" gibt über 4.000 U/min an die Motorsteuerung ab und schließt unter 3.500 U/min
+  wieder. Anfangs aus: einschalten unter Einstellungen › MHD-Tuning.
+- **Öltemperatur:** erster glaubhafter Wert aus 4402, 5822 und dem Fahrzeugsignal (am G20
+  lieferte 4402 0 °C).
 - **Fehlerspeicher:** lesen bei allen Steuergeräten; **löschen** nur bei Zündung an
   und Motor aus, mit Bestätigung, Steuergerät für Steuergerät, nie die Headunit.
 - **Bedienung (ab 0.3.0):** Antippen und Controller (drehen/drücken) auf allen

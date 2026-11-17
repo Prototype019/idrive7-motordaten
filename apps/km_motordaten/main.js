@@ -32,6 +32,7 @@ var Car = require('./kit/car');
 var Diag = require('./kit/diag').Diag;
 
 var dash = require('./dash.js');
+var dash7 = require('./dash7.js');
 var decode = require('./decode.js');
 var Limits = require('./limits.js');
 var clock = require('./clock.js');
@@ -55,6 +56,8 @@ var SW = dash.W, SH = dash.H;                       // 2880 x 764 (dash.js)
 var VIS = { x: 12, y: 38, w: 1576, h: 482 };
 var K = VIS.w / SW;                                  // dash -> Seite
 var OX = VIS.x, OY = VIS.y + (VIS.h - SH * K) / 2;
+// Live-Seite (dash7.js): rechts der Tab-Leiste bis zum rechten Rand, in Seiten-Pixeln
+var LIVE_BOX = { x0: Math.round(OX + dash.RAIL * K + 26), x1: VIS.x + VIS.w - 16 };
 var FONT = { label: 'md_label', scale: 'md_scale', num: 'md_num', bold: 'md_label', light: 'md_label', gear: 'md_num' };
 
 // DID-Gruppen wie die M2-App ([Schluessel, DID]), Benziner G-Serie DME8FF_R (B58/S58).
@@ -70,6 +73,8 @@ var COOLING = [['coolTarget', 0x4310], ['fanDuty', 0x587F], ['fanRpm', 0x594F], 
 var BATTERY = [['battSoc', 0x5425]];
 var SLOW = [['intake', 0x580F], ['ambient', 0x4201], ['exhaust', 0x582F], ['oil', 0x4402], ['coolant', 0x4300],
     ['charge', 0x59D4]];
+// eigene Anfrage: kennt eine DME 5822 nicht, bleibt die SLOW-Gruppe davon unberuehrt
+var OILSUMP = [['oilSump', 0x5822]];
 var MAXK = ['rpm', 'power', 'torque', 'boost', 'oilPress', 'oil', 'coolant', 'gearbox', 'intake', 'charge', 'exhaust', 'knock'];
 
 var isNum = function (v) { return typeof v === 'number' && isFinite(v); };
@@ -96,6 +101,8 @@ mgu.run({
         function saveMhd(v) { try { if (MHD_FILE) fs.writeFileSync(MHD_FILE, JSON.stringify({ mhd: v, at: Date.now() })); } catch (e) { } }
 
         var cooling = { state: null }, coolingTimer = null, probeAt = 0, probeTries = 0, probing = false;
+        // MHD-Abgasklappe: AUTO (DME entscheidet) / OPEN / CLOSED; paused = "Zu" ueber FLAP_OPEN_RPM an die DME abgegeben
+        var flap = { state: 'AUTO', busy: false, paused: false }, flapTimer = null;
         var recordsConfirm = false;
 
         // Alle Diagnose-Anfragen nacheinander (Polling, Fehler lesen/loeschen, Max Cooling)
@@ -114,7 +121,8 @@ mgu.run({
         var rec = null, faultsBusy = false, clearing = false;
 
         function visible() { return ui.isVisible('MAIN'); }
-        function active() { return visible() || !!rec; }
+        // auch bei gehaltener Klappe "Zu": die Drehzahlgrenze (FLAP_OPEN_RPM) braucht die Drehzahl
+        function active() { return visible() || !!rec || flap.state === 'CLOSED'; }
 
         // ---- Werte-Quellen ----
         var car = new Car(ctx, ['rpm', 'temps']);
@@ -193,6 +201,7 @@ mgu.run({
                     }
                     if (slow) {
                         add(function () { return readGroup(DME, SLOW); });
+                        add(function () { return readGroup(DME, OILSUMP); });
                         add(readEgs); add(readVoltage);
                     }
                     return seq;
@@ -210,7 +219,9 @@ mgu.run({
                 probing = false;
                 if (u && u[0] === 0x6F && u[1] === 0x03 && u[2] === 0x00) {
                     mhd = true; saveMhd(true); cooling.state = 'OFF';
-                    if (!cfg.mhdCoolingOn) { cfg.mhdCoolingOn = 1; saveCfg(); }       // beim ersten Erkennen einschalten
+                    // Max Cooling beim ersten Erkennen einschalten; die Klappe bleibt aus, bis der Fahrer sie
+                    // unter Einstellungen > MHD-Tuning einschaltet (mhdFlapOn, Standard 0)
+                    if (!cfg.mhdCoolingOn) { cfg.mhdCoolingOn = 1; saveCfg(); }
                     log.info('MHD erkannt: Max Cooling verfuegbar');
                 } else if (u && u[0] === 0x7F && (u[2] === 0x11 || u[2] === 0x12 || u[2] === 0x31)) {
                     mhd = false; saveMhd(false); log.info('kein MHD (DME: ' + u[2].toString(16) + ')');
@@ -237,12 +248,22 @@ mgu.run({
         }
         function pick(a, b) { return isNum(a) ? a : (isNum(b) ? b : null); }
         function num(v) { return isNum(v) ? v : null; }
+        /* Oeltemperatur: am G20 (iD7) lieferte 4402 "Oel nach Filter" 0 °C bei 106 °C Kuehlmittel (Feldfoto
+         * 17.11.). Darum die erste glaubhafte von 4402, 5822 (Oelsumpf) und dem Fahrzeugsignal (CDS):
+         * im Bereich -40..200 °C, und kein Wert um 0 °C, waehrend das Kuehlmittel schon ueber 40 °C hat. */
+        function oilNow(coolant) {
+            var ok = function (t) { return isNum(t) && t > -40 && t < 200 && !(t < 2 && isNum(coolant) && coolant > 40); };
+            var c = [m.oil, m.oilSump, cds.oil];
+            for (var i = 0; i < c.length; i++) if (ok(c[i])) return c[i];
+            return null;
+        }
 
         function buildV() {
             var ambient = isNum(m.ambient) ? m.ambient / 1000 : null;            // hPa -> bar
             var above = function (abs) { return (isNum(abs) && isNum(ambient)) ? abs - ambient : null; };
+            var coolant = pick(m.coolant, cds.coolant);
             var v = {
-                rpm: rpmNow(), oil: pick(m.oil, cds.oil), coolant: pick(m.coolant, cds.coolant),
+                rpm: rpmNow(), oil: oilNow(coolant), coolant: coolant,
                 intake: num(m.intake), charge: num(m.charge), boost: above(m.boostAbs), boostTarget: above(m.boostTargetAbs),
                 oilPress: above(m.oilPressAbs), gearbox: num(m.gearbox), exhaust: num(m.exhaust), voltage: num(m.voltage),
                 // nur beim Aufnehmen gelesen (ENGINE/ENGINE2): fuer die Logs
@@ -316,6 +337,7 @@ mgu.run({
             try {
                 if (!active()) return;
                 lastV = buildV();
+                flapGuard(lastV.rpm);
                 if (rec) {
                     if (rec.sample(lastV) === false) { stopRecording(); }
                     else { extra.recording = { ms: Date.now() - rec.started }; }
@@ -394,6 +416,48 @@ mgu.run({
             sendCooling(cooling.state !== 'ON');
         }
 
+        // ---- MHD-Abgasklappe: 2F 02 00 Auto / 01 Auf / 02 Zu, angenommen nur mit dem Echo 6F 02 nn ----
+        // (wie MHDs eigene App, mitgeschnitten in cauliflowermossgrape/idrive7-apps live_adjustments, MIT).
+        // "Zu" gibt ueber FLAP_OPEN_RPM an die DME ab (die oeffnet bei Last selbst) und schliesst unter
+        // FLAP_CLOSE_RPM wieder - wie dort; "Auf" und "Auto" gelten immer.
+        var FLAP_CODE = { AUTO: 0x00, OPEN: 0x01, CLOSED: 0x02 };
+        var FLAP_NEXT = { AUTO: 'OPEN', OPEN: 'CLOSED', CLOSED: 'AUTO' };
+        var FLAP_OPEN_RPM = 4000, FLAP_CLOSE_RPM = 3500;
+        var accFlap = function (u) { return (u[0] === 0x6F && u[1] === 0x02) || (u[0] === 0x7F && u[1] === 0x2F); };
+        function flapNote(note) {
+            clearTimeout(flapTimer);
+            flap = Object.assign({}, flap, { note: note });
+            flapTimer = setTimeout(function () { flap = Object.assign({}, flap, { note: null }); }, 3000);
+        }
+        /* code an die DME; ok(true) nur mit dem passenden Echo */
+        function sendFlap(code) {
+            return serial(function () { return link.physical(DME, 0x2F, [0x02, code], 2500, accFlap); })
+                .then(function (u) { return !!(u && u[0] === 0x6F && u[1] === 0x02 && u[2] === code); }, function () { return false; });
+        }
+        function flapPressed() {
+            if (mhd !== true || !cfg.mhdFlapOn || flap.busy) return;
+            var want = FLAP_NEXT[flap.state] || 'AUTO';
+            var rpm = lastV && lastV.rpm;
+            var paused = want === 'CLOSED' && isNum(rpm) && rpm > FLAP_OPEN_RPM;    // ueber der Grenze: erst Auto
+            flap = Object.assign({}, flap, { busy: true, note: null });
+            sendFlap(paused ? FLAP_CODE.AUTO : FLAP_CODE[want]).then(function (ok) {
+                log.info('Klappe ' + want + (paused ? ' (ueber ' + FLAP_OPEN_RPM + ' U/min: Auto)' : '') + ': ' + (ok ? 'bestaetigt' : 'keine Bestaetigung'));
+                flap = ok ? { state: want, busy: false, paused: paused } : Object.assign({}, flap, { busy: false });
+                if (!ok) flapNote('Kein MHD-Echo');
+            });
+        }
+        /* im 100-ms-Takt: "Zu" ueber der Grenze an die DME abgeben, darunter wieder schliessen */
+        function flapGuard(rpm) {
+            if (mhd !== true || flap.state !== 'CLOSED' || flap.busy || !isNum(rpm)) return;
+            var pause = rpm > FLAP_OPEN_RPM ? true : rpm < FLAP_CLOSE_RPM ? false : flap.paused;
+            if (pause === flap.paused) return;
+            flap = Object.assign({}, flap, { busy: true });
+            sendFlap(pause ? FLAP_CODE.AUTO : FLAP_CODE.CLOSED).then(function (ok) {
+                log.info('Klappe Zu ' + (pause ? 'an die DME abgegeben' : 'wieder geschlossen') + ' bei ' + Math.round(rpm) + ' U/min: ' + (ok ? 'ok' : 'ohne Echo'));
+                flap = Object.assign({}, flap, { busy: false, paused: ok ? pause : flap.paused });
+            });
+        }
+
         // ---- Fehlerspeicher loeschen (wie die M2-App) ----
         var NO_CLEAR = [0x63];
         var acc14 = function (u) { return u[0] === 0x54 || (u[0] === 0x7F && u[1] === 0x14); };
@@ -468,6 +532,7 @@ mgu.run({
             if (id === 'reset') { peak = {}; trip = {}; return; }
             if (id === 'record') { toggleRecord(); return; }
             if (id === 'cooling' || id === 'cooling!') { coolingPressed(); return; }
+            if (id === 'flap') { flapPressed(); return; }
             if (id === 'faults:read') { readFaults(); return; }
             if (id === 'faults:clear') {
                 if (clearing || faultsBusy) return;
@@ -499,8 +564,10 @@ mgu.run({
         // Umleiter fuer dash.js: dieselben 7 Zeichenbefehle, von dash-Koordinaten (2880x764) auf die Seite
         // skaliert (selbst, nicht per cv.xf: xf heisst im Kit "nur GPU" - ohne Renderer bliebe die Seite leer),
         // Texte woertlich (keine Kit-Uebersetzung) in unseren Schriften. Breiten gehen in dash-Einheiten zurueck.
-        function painter(cv) {
-            var X = function (x) { return OX + x * K; }, Y = function (y) { return OY + y * K; }, S = function (v) { return v * K; };
+        // k/ox/oy: ohne Angabe dash-Koordinaten (2880x764 -> Seite); painter(cv, 1, 0, 0) zeichnet in Seiten-Pixeln (dash7.js)
+        function painter(cv, k, ox, oy) {
+            var KK = k || K, OXX = ox != null ? ox : OX, OYY = oy != null ? oy : OY;
+            var X = function (x) { return OXX + x * KK; }, Y = function (y) { return OYY + y * KK; }, S = function (v) { return v * KK; };
             var opts = function (o) {
                 var r = {}; if (o) { for (var k in o) r[k] = o[k]; }
                 r.font = FONT[r.font || 'label'] || 'md_label'; r.literal = true;
@@ -514,8 +581,8 @@ mgu.run({
                 roundRect: function (x, y, w, h, r, c) { cv.roundRect(X(x), Y(y), S(w), S(h), S(r), c); return P; },
                 strokeRoundRect: function (x, y, w, h, r, lw, c) { cv.strokeRoundRect(X(x), Y(y), S(w), S(h), S(r), S(lw), c); return P; },
                 polyline: function (pts, lw, c) { cv.polyline(pts.map(function (p) { return [X(p[0]), Y(p[1])]; }), S(lw), c); return P; },
-                text: function (s, x, y, size, c, o) { return cv.text(s, X(x), Y(y), S(size), c, opts(o)) / K; },
-                textWidth: function (s, size, o) { return cv.textWidth(s, S(size), opts(o)) / K; }
+                text: function (s, x, y, size, c, o) { return cv.text(s, X(x), Y(y), S(size), c, opts(o)) / KK; },
+                textWidth: function (s, size, o) { return cv.textWidth(s, S(size), opts(o)) / KK; }
             };
             return P;
         }
@@ -528,18 +595,39 @@ mgu.run({
             var v = Object.assign({}, lastV); glide(v);
             // Max-Cooling-Knopf nur, wenn MHD erkannt ist und die Option an ist
             extra.cooling = (mhd === true && cfg.mhdCoolingOn) ? Object.assign({}, cooling) : null;
+            extra.flap = (mhd === true && cfg.mhdFlapOn) ? Object.assign({}, flap) : null;
             if (page === 'records') extra.maxima = { trip: trip, rec: records.best, confirm: recordsConfirm };
             var cv = ctx.canvas(1600, 520).clear(bg);
-            try { dash.draw(painter(cv), page, v, cfg, { focus: null, pressed: null }, extra); }
-            catch (e) { log.warn('draw ' + page + ': ' + e); }
+            var noUi = { focus: null, pressed: null };
+            // Live: die Tab-Leiste wie auf jeder Seite (dash.js, skaliert), der Inhalt gross in Seiten-Pixeln (dash7.js)
+            try {
+                if (page === 'main') {
+                    cv.fillRect(VIS.x, VIS.y, VIS.w, VIS.h, bg);
+                    dash.rail(painter(cv), 'main', noUi);
+                    dash7.live(painter(cv, 1, 0, 0), v, cfg, noUi, extra, LIVE_BOX);
+                } else {
+                    dash.draw(painter(cv), page, v, cfg, noUi, extra);
+                }
+            } catch (e) { log.warn('draw ' + page + ': ' + e); }
             // jedes antippbare Feld als Kit-Ziel (Seiten-Pixel); Schluessel ohne "!", damit der Controller-Fokus
             // beim Bestaetigen (cooling -> cooling!) auf dem Knopf bleibt
             var tg = [];
-            try { tg = dash.targets(page, extra) || []; } catch (e) { log.warn('targets ' + page + ': ' + e); }
+            try {
+                tg = (page === 'main' ? dash.targets('main', extra).filter(function (t) { return t.id.indexOf('tab:') === 0; })
+                    : dash.targets(page, extra)) || [];
+            } catch (e) { log.warn('targets ' + page + ': ' + e); }
             tg.forEach(function (t) {
                 var id = t.id;
                 cv.target(OX + t.x * K, OY + t.y * K, t.w * K, t.h * K, function () { act(id); }, id.replace(/!$/, ''));
             });
+            if (page === 'main') {
+                try {
+                    dash7.targets(extra, LIVE_BOX).forEach(function (t) {
+                        var id = t.id;
+                        cv.target(t.x, t.y, t.w, t.h, function () { act(id); }, id.replace(/!$/, ''));
+                    });
+                } catch (e) { log.warn('targets live: ' + e); }
+            }
             return ui.image('MAIN_GFX', cv);
         });
 

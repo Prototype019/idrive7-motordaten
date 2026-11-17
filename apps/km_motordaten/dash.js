@@ -119,7 +119,7 @@ const BACK_SET = { id: 'settings:back', x: W - PAD - 300, y: 64, w: 300, h: 84, 
 const MENU = [
     { id: 'menu:limits', page: 'limits', label: 'Grenzwerte', text: 'Ab wann die Werte rot werden' },
     { id: 'menu:ready', page: 'ready', label: 'Bereit für Volllast', text: 'Welche Temperaturen erreicht sein müssen' },
-    { id: 'menu:mhd', page: 'mhd', label: 'MHD-Tuning', text: 'Max Cooling direkt aus der App' }
+    { id: 'menu:mhd', page: 'mhd', label: 'MHD-Tuning', text: 'Max Cooling und Klappe aus der App' }
 ].map((m, i, all) => {
     const gap = 52;
     const w = Math.floor((W - PAD - X0 - gap * (all.length - 1)) / all.length);
@@ -160,7 +160,9 @@ const READY_TARGETS = readyTargets();
 
 /* The MHD page: the switch for the Max Cooling button. */
 const MHD_SWITCH = { id: 'toggle:mhdCoolingOn', x: X0, y: SET_TOP + 30, w: 220, h: BTN, label: '' };
-const MHD_TARGETS = [MHD_SWITCH, BACK_SET];
+/* iD7: the exhaust flap's button (MHD 2F 02), under Max Cooling's switch */
+const MHD_FLAP_SWITCH = { id: 'toggle:mhdFlapOn', x: X0, y: SET_TOP + 30 + BTN + 30, w: 220, h: BTN, label: '' };
+const MHD_TARGETS = [MHD_SWITCH, MHD_FLAP_SWITCH, BACK_SET];
 
 /* ---- the logs pages ---- */
 
@@ -687,13 +689,17 @@ function mhdPage(rec, cfg, ui) {
     const on = !!cfg.mhdCoolingOn;
     toggleSwitch(rec, MHD_SWITCH, on, ui);
     rec.text('Max Cooling-Knopf auf der Live-Seite', MHD_SWITCH.x + MHD_SWITCH.w + 56, MHD_SWITCH.y + 64, 44, on ? C.text : C.dim, { font: 'label' });
+    const flap = !!cfg.mhdFlapOn;
+    toggleSwitch(rec, MHD_FLAP_SWITCH, flap, ui);
+    rec.text('Klappen-Knopf auf der Live-Seite (Auto / Auf / Zu)', MHD_FLAP_SWITCH.x + MHD_FLAP_SWITCH.w + 56, MHD_FLAP_SWITCH.y + 64, 44,
+        flap ? C.text : C.dim, { font: 'label' });
     const lines = [
-        'MHD lässt Wasserpumpe und Lüfter auf voller Leistung laufen, etwa vor oder nach schnellen Runden.',
-        'Einschalten nur bei laufendem Motor, Ausschalten jederzeit, beides mit einem Tippen.',
-        'Die App sendet dafür genau einen Befehl an die Motorsteuerung (2F 03 01 an, 2F 03 00 aus).',
-        'Ob es aktiv ist, meldet MHD nicht zurück: die App zeigt den zuletzt bestätigten Befehl.'
+        'Max Cooling: Wasserpumpe und Lüfter auf voller Leistung. An nur bei laufendem Motor (2F 03 01 / 2F 03 00).',
+        'Klappe: Auto lässt die Motorsteuerung entscheiden, Auf / Zu halten die Abgasklappe (2F 02 00 / 01 / 02).',
+        'Zu gibt über 4.000 U/min an die Motorsteuerung ab und schließt unter 3.500 U/min wieder.',
+        'MHD meldet den Zustand nicht zurück: die App zeigt den zuletzt bestätigten Befehl.'
     ];
-    lines.forEach((l, i) => rec.text(l, X0, MHD_SWITCH.y + 190 + i * 52, 30, C.dim, { font: 'label' }));
+    lines.forEach((l, i) => rec.text(l, X0, MHD_FLAP_SWITCH.y + 170 + i * 50, 30, C.dim, { font: 'label' }));
     button(rec, BACK_SET, ui);
 }
 
@@ -1126,4 +1132,6 @@ function draw(rec, page, v, cfg, ui, extra) {
     return rec;
 }
 
-module.exports = { draw, targets, tempCellBoxes, tempSlotAt, W, H, C };
+module.exports = { draw, targets, tempCellBoxes, tempSlotAt, W, H, C,
+    // iD7: the large live page (dash7.js) draws with these
+    rail, button, valueUnit, heatStrip, battery, mix, de, thousands, HEAT, TABS, RAIL, RPM_MAX, OIL_MAX };
