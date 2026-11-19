@@ -434,29 +434,72 @@ mgu.run({
             return serial(function () { return link.physical(DME, 0x2F, [0x02, code], 2500, accFlap); })
                 .then(function (u) { return !!(u && u[0] === 0x6F && u[1] === 0x02 && u[2] === code); }, function () { return false; });
         }
-        function flapPressed() {
-            if (mhd !== true || !cfg.mhdFlapOn || flap.busy) return;
-            var want = FLAP_NEXT[flap.state] || 'AUTO';
+        var FLAP_NO_RPM_MS = 2000, FLAP_RETRY_MS = 1000;       // ohne Drehzahl so lange: "Zu" an die DME; ohne Echo: neuer Versuch danach
+        var flapRetryAt = 0, flapNoRpm = 0, flapBackTries = 0;
+        /*
+         * want: AUTO / OPEN / CLOSED. guard: aus flapGuard ({ pause }: "Zu" an die DME abgeben oder wieder schliessen,
+         * der Zustand bleibt CLOSED). force: auch bei ausgeschaltetem Schalter (Klappe an die DME zurueckgeben).
+         */
+        function setFlap(want, guard, force) {
+            if (mhd !== true || (!force && !cfg.mhdFlapOn) || flap.busy) return;
             var rpm = lastV && lastV.rpm;
-            var paused = want === 'CLOSED' && isNum(rpm) && rpm > FLAP_OPEN_RPM;    // ueber der Grenze: erst Auto
+            var paused = want === 'CLOSED' && (guard ? !!guard.pause : isNum(rpm) && rpm > FLAP_OPEN_RPM);   // ueber der Grenze: erst Auto
+            clearTimeout(flapTimer);
             flap = Object.assign({}, flap, { busy: true, note: null });
             sendFlap(paused ? FLAP_CODE.AUTO : FLAP_CODE[want]).then(function (ok) {
-                log.info('Klappe ' + want + (paused ? ' (ueber ' + FLAP_OPEN_RPM + ' U/min: Auto)' : '') + ': ' + (ok ? 'bestaetigt' : 'keine Bestaetigung'));
+                log.info('Klappe ' + want + (paused ? ' (an die DME abgegeben)' : '') + ': ' + (ok ? 'bestaetigt' : 'keine Bestaetigung'));
                 flap = ok ? { state: want, busy: false, paused: paused } : Object.assign({}, flap, { busy: false });
-                if (!ok) flapNote('Kein MHD-Echo');
+                if (!ok) { flapRetryAt = Date.now() + FLAP_RETRY_MS; flapNote('Kein MHD-Echo'); }
             });
         }
-        /* im 100-ms-Takt: "Zu" ueber der Grenze an die DME abgeben, darunter wieder schliessen */
+        function flapPressed() {
+            if (mhd !== true || !cfg.mhdFlapOn || flap.busy) return;
+            setFlap(FLAP_NEXT[flap.state] || 'AUTO', null, false);
+        }
+        /*
+         * im 100-ms-Takt: eine gehaltene Klappe bei ausgeschaltetem Schalter zurueck an die DME (auch wenn der Schalter
+         * aus ging, waehrend ein Befehl unterwegs war; nach 3 Versuchen ohne Echo aufgegeben); "Zu" ueber
+         * FLAP_OPEN_RPM und nach FLAP_NO_RPM_MS ohne Drehzahl an die DME, unter FLAP_CLOSE_RPM wieder schliessen.
+         */
         function flapGuard(rpm) {
-            if (mhd !== true || flap.state !== 'CLOSED' || flap.busy || !isNum(rpm)) return;
+            if (flap.state === 'AUTO') { flapBackTries = 0; flapNoRpm = 0; }
+            if (mhd !== true || flap.state === 'AUTO' || flap.busy || Date.now() < flapRetryAt) return;
+            if (!cfg.mhdFlapOn) {
+                if (++flapBackTries > 3) {
+                    log.warn('Klappe: Rueckgabe ohne Bestaetigung aufgegeben');
+                    flap = { state: 'AUTO', busy: false, paused: false }; flapBackTries = 0;
+                    return;
+                }
+                setFlap('AUTO', null, true);
+                return;
+            }
+            flapBackTries = 0;
+            if (flap.state !== 'CLOSED') { flapNoRpm = 0; return; }
+            if (!isNum(rpm)) {
+                flapNoRpm = flapNoRpm || Date.now();
+                if (!flap.paused && Date.now() - flapNoRpm > FLAP_NO_RPM_MS) {
+                    log.warn('Klappe: keine Drehzahl, Zu an die DME abgegeben');
+                    setFlap('CLOSED', { pause: true }, true);
+                }
+                return;
+            }
+            flapNoRpm = 0;
             var pause = rpm > FLAP_OPEN_RPM ? true : rpm < FLAP_CLOSE_RPM ? false : flap.paused;
-            if (pause === flap.paused) return;
-            flap = Object.assign({}, flap, { busy: true });
-            sendFlap(pause ? FLAP_CODE.AUTO : FLAP_CODE.CLOSED).then(function (ok) {
-                log.info('Klappe Zu ' + (pause ? 'an die DME abgegeben' : 'wieder geschlossen') + ' bei ' + Math.round(rpm) + ' U/min: ' + (ok ? 'ok' : 'ohne Echo'));
-                flap = Object.assign({}, flap, { busy: false, paused: ok ? pause : flap.paused });
-            });
+            if (pause !== flap.paused) setFlap('CLOSED', { pause: pause }, true);
         }
+        // Beenden (MainApp: "shutdown", das Kit ruft 200 ms spaeter process.exit): eine gehaltene Klappe noch an die
+        // DME zurueck, hoechstens 600 ms warten
+        var realExit = process.exit, exiting = false;
+        process.exit = function (code) {
+            if (!exiting && mhd === true && flap.state !== 'AUTO') {
+                exiting = true;
+                var done = function () { realExit.call(process, code); };
+                setTimeout(done, 600);
+                sendFlap(FLAP_CODE.AUTO).then(done, done);
+                return;
+            }
+            return realExit.apply(process, arguments);
+        };
 
         // ---- Fehlerspeicher loeschen (wie die M2-App) ----
         var NO_CLEAR = [0x63];

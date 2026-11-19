@@ -19,7 +19,8 @@ den [mgu-store](https://github.com/robertnisipeanu/mgu-store).
   (`dash7.js`): Drehzahl, Öltemperatur, Ladedruck, Öldruck groß, darunter die übrigen Werte.
 - **MHD-Abgasklappe (ab 0.4.0):** Knopf „Klappe: Auto / Auf / Zu" (`2F 02 00/01/02`, nur mit
   MHD-Echo). „Zu" gibt über 4.000 U/min an die Motorsteuerung ab und schließt unter 3.500 U/min
-  wieder. Anfangs aus: einschalten unter Einstellungen › MHD-Tuning.
+  wieder; ohne Drehzahl (2 s) ebenfalls an die Motorsteuerung. Schalter aus oder App-Ende: eine gehaltene
+  Klappe geht an die Motorsteuerung zurück. Anfangs aus: einschalten unter Einstellungen › MHD-Tuning.
 - **Öltemperatur:** erster glaubhafter Wert aus 4402, 5822 und dem Fahrzeugsignal (am G20
   lieferte 4402 0 °C).
 - **Fehlerspeicher:** lesen bei allen Steuergeräten; **löschen** nur bei Zündung an
